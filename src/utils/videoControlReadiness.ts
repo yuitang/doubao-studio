@@ -68,7 +68,7 @@ export class VideoControlReadinessError extends Error {
   readonly code: string;
   readonly diagnostic: VideoControlReadinessResult;
 
-  constructor(stage: VideoControlReadinessStage, diagnostic: VideoControlReadinessResult) {
+  constructor(stage: VideoControlReadinessStage, diagnostic: VideoControlReadinessResult, detail?: string) {
     const normalizedStage = stage === 'mode_entry' ? 'video_entry'
       : stage === 'model_control' ? 'model'
         : stage === 'composite_control' ? 'aspect_ratio'
@@ -82,7 +82,7 @@ export class VideoControlReadinessError extends Error {
       stable_readback: 'video_stable_readback_not_ready', final_readback: 'video_final_readback_not_ready',
     };
     const code = codeByStage[normalizedStage] ?? `video_${normalizedStage}_not_ready`;
-    super(`${code}: ${normalizedStage} 未在有界等待内就绪（${diagnostic.elapsedMs}ms/${diagnostic.attempts}次），已在提交前停止`);
+    super(`${code}: ${normalizedStage} 未在有界等待内就绪（${diagnostic.elapsedMs}ms/${diagnostic.attempts}次），已在提交前停止${detail ? ` | ${detail}` : ''}`);
     this.name = 'VideoControlReadinessError';
     this.code = code;
     this.diagnostic = {

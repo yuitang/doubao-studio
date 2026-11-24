@@ -42,6 +42,13 @@ import {
   getSubmissionMessageCount,
   getSubmissionEvidence,
   startNewConversation,
+  diagnoseVideoModeEntry,
+  probeStandardVideoEntry,
+  openCanvasVideoComposer,
+  configureCanvasVideoOptions,
+  openCanvasUploadPicker,
+  injectCanvasPrompt,
+  submitCanvasComposer,
   detectRobotVerification,
   resolveVideoArtifact,
   manualResolveVideoArtifact,
@@ -1325,6 +1332,8 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
       taskConversationUrl = webview.getURL();
       await persistVideoReadiness('new_conversation');
       // 根据任务模式切换到对应页面
+      // 飞书登录态等新版 UI 无标准视频入口时走画布通道；声明在外层供注入/提交阶段使用
+      let canvasMode = false;
       if (mode && mode !== 'chat') {
         const modeLabel = mode === 'image' ? '图片' : mode === 'video' ? '视频' : mode === 'music' ? '音乐' : mode;
         setAccountAutomationState(accountId, 'injecting', '切换到' + modeLabel + '模式...', 'switching_mode');
@@ -1333,25 +1342,59 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
         await clearKnownPromotion();
 
         // image/video 模式：在 AI 创作页面点击 Tab 切换
+        // 飞书登录态等新版 UI 没有「视频生成」composer 入口，探测不到时走画布通道
         if (mode === 'image' || mode === 'video') {
-          setAccountAutomationState(accountId, 'injecting', '点击' + modeLabel + 'Tab...', 'switching_mode');
-          const modeEntryStartedAt = Date.now();
-          const switched = await clickAITab(webview, mode);
-          modeEntryElapsedMs = Date.now() - modeEntryStartedAt;
-          if (!switched) {
-            if (mode === 'video') {
+          const useCanvasFlow = mode === 'video' && !(await probeStandardVideoEntry(webview, 3500));
+          if (useCanvasFlow) {
+            canvasMode = true;
+            setAccountAutomationState(accountId, 'injecting', '标准入口不可用，切换画布通道...', 'switching_mode');
+            const canvasEntryStartedAt = Date.now();
+            const opened = await openCanvasVideoComposer(webview);
+            modeEntryElapsedMs = Date.now() - canvasEntryStartedAt;
+            if (!opened.ok) {
               throw new VideoControlReadinessError('mode_entry', {
                 ready: false, failureStage: 'mode_entry', attempts: 1, elapsedMs: modeEntryElapsedMs,
-              });
+              }, `canvas: ${opened.error}`);
             }
-            throw new Error(`${modeLabel}模式入口未就绪，已在提交前停止`);
+            if (videoConfig) {
+              setAccountAutomationState(accountId, 'injecting', '配置画布视频参数...', 'configuring');
+              const configured = await configureCanvasVideoOptions(webview, {
+                model: videoConfig.model,
+                aspectRatio: videoConfig.aspectRatio,
+                duration: videoConfig.duration,
+              });
+              if (!configured.ok) {
+                const error = configured.error || '画布视频参数配置失败';
+                if (error.includes('membership_required')) throw new Error(error);
+                throw new VideoControlReadinessError('model', {
+                  ready: false, failureStage: 'model', attempts: 1, elapsedMs: modeEntryElapsedMs,
+                }, `canvas: ${error}`);
+              }
+            }
+            await pause(500);
+          } else {
+            setAccountAutomationState(accountId, 'injecting', '点击' + modeLabel + 'Tab...', 'switching_mode');
+            const modeEntryStartedAt = Date.now();
+            const switched = await clickAITab(webview, mode);
+            modeEntryElapsedMs = Date.now() - modeEntryStartedAt;
+            if (!switched) {
+              if (mode === 'video') {
+                // 附加页面入口诊断快照，便于定位新版豆包 UI 与识别逻辑的差异
+                const entryDiagnosis = await diagnoseVideoModeEntry(webview);
+                throw new VideoControlReadinessError('mode_entry', {
+                  ready: false, failureStage: 'mode_entry', attempts: 1, elapsedMs: modeEntryElapsedMs,
+                }, `${entryDiagnosis}`);
+              }
+              throw new Error(`${modeLabel}模式入口未就绪，已在提交前停止`);
+            }
+            if (mode === 'video') await persistVideoReadiness('video_entry');
+            await pause(1500); // 等待 Tab 切换动画
           }
-          if (mode === 'video') await persistVideoReadiness('video_entry');
-          await pause(1500); // 等待 Tab 切换动画
         }
 
         // 视频模式：只使用页面可见控件配置，禁止请求改写绕过会员门槛。
-        if (mode === 'video') {
+        // 画布通道已在入口阶段完成参数配置，这里只处理标准聊天通道。
+        if (mode === 'video' && videoConfig && !canvasMode) {
           if (videoConfig) {
             setAccountAutomationState(accountId, 'injecting', '配置视频参数...', 'configuring');
             const configure = () => configureVideoOptions(webview, videoConfig, {
@@ -1380,6 +1423,13 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
         // 有参考图片时上传
         if (attachments && attachments.length > 0) {
           setAccountAutomationState(accountId, 'injecting', '上传参考图片...', 'uploading_assets');
+          if (canvasMode) {
+            // 画布通道：先点击视频节点配置条「+」促使文件输入框挂载，再注入文件
+            const picker = await openCanvasUploadPicker(webview);
+            if (!picker.ok) {
+              console.warn('[BrowserPanel] 画布上传挂载失败，尝试直接注入:', picker.error);
+            }
+          }
           // 读取文件为 base64
           const fileDataList: Array<{ name: string; base64: string; mime: string }> = [];
           for (const filePath of attachments) {
@@ -1467,24 +1517,41 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
 
       setAccountAutomationState(accountId, 'injecting', '正在注入提示词...', 'injecting_prompt');
       let injected = false;
-      try {
-        injected = await Promise.race([
-          injectPrompt(webview, prompt),
-          new Promise<boolean>((_, rej) => setTimeout(() => rej(new Error('注入超时')), 60000)),
-        ]);
-      } catch {
-        throw new VideoControlReadinessError('prompt', {
-          ...createVideoReadinessCheckpoint('prompt'), ready: false, failureStage: 'prompt', missingControl: 'prompt_editor', elapsedMs: 60_000,
-        });
-      }
-      if (!injected) throw new VideoControlReadinessError('prompt', {
-        ...createVideoReadinessCheckpoint('prompt'), ready: false, failureStage: 'prompt', missingControl: 'prompt_editor',
-      });
-      await pause(800);
-      if (!await verifyPromptReadyForSubmission(webview, prompt)) {
-        throw new VideoControlReadinessError('prompt', {
+      if (canvasMode) {
+        // 画布通道：注入到画布视频节点编辑器（内部已做回读验证）
+        try {
+          injected = await Promise.race([
+            injectCanvasPrompt(webview, prompt),
+            new Promise<boolean>((_, rej) => setTimeout(() => rej(new Error('注入超时')), 60000)),
+          ]);
+        } catch {
+          throw new VideoControlReadinessError('prompt', {
+            ...createVideoReadinessCheckpoint('prompt'), ready: false, failureStage: 'prompt', missingControl: 'prompt_editor', elapsedMs: 60_000,
+          });
+        }
+        if (!injected) throw new VideoControlReadinessError('prompt', {
           ...createVideoReadinessCheckpoint('prompt'), ready: false, failureStage: 'prompt', missingControl: 'prompt_editor',
         });
+      } else {
+        try {
+          injected = await Promise.race([
+            injectPrompt(webview, prompt),
+            new Promise<boolean>((_, rej) => setTimeout(() => rej(new Error('注入超时')), 60000)),
+          ]);
+        } catch {
+          throw new VideoControlReadinessError('prompt', {
+            ...createVideoReadinessCheckpoint('prompt'), ready: false, failureStage: 'prompt', missingControl: 'prompt_editor', elapsedMs: 60_000,
+          });
+        }
+        if (!injected) throw new VideoControlReadinessError('prompt', {
+          ...createVideoReadinessCheckpoint('prompt'), ready: false, failureStage: 'prompt', missingControl: 'prompt_editor',
+        });
+        await pause(800);
+        if (!await verifyPromptReadyForSubmission(webview, prompt)) {
+          throw new VideoControlReadinessError('prompt', {
+            ...createVideoReadinessCheckpoint('prompt'), ready: false, failureStage: 'prompt', missingControl: 'prompt_editor',
+          });
+        }
       }
       await persistVideoReadiness('prompt');
 
@@ -1521,7 +1588,8 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
       // 参考素材首次用于某个账号时，新版页面会用“安全确认”遮挡发送按钮。
       // 自动化只识别、不代点。由于人工“确认”可能直接提交，必须先持久化提交意图，
       // 再等待用户操作并回读同一 run，避免任务失联或二次发送。
-      if (mode === 'video' && attachments && attachments.length > 0) {
+      // 画布通道的素材直接注入视频节点，不存在该聊天弹窗，跳过检测避免误判。
+      if (mode === 'video' && attachments && attachments.length > 0 && !canvasMode) {
         const authorization = await inspectMaterialAuthorization(webview);
         if (authorization === 'blocked') {
           throw new AccountAvailabilityPauseError('素材安全确认未完成，请检查右侧页面；本次尚未提交', 'material_authorization_required');
@@ -1619,7 +1687,7 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
         }
       }
 
-      if (!authorizationTriggeredSubmission && !await waitForSubmissionControlsStable(webview)) {
+      if (!canvasMode && !authorizationTriggeredSubmission && !await waitForSubmissionControlsStable(webview)) {
         throw new VideoControlReadinessError('submission_controls', {
           ...createVideoReadinessCheckpoint('submission_controls', {
             elapsedMs: Date.now() - videoReadinessStartedAt,
@@ -1657,10 +1725,15 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
       // 之前的"生成视频"文字按钮会发送默认提示词，不是输入框内容
       if (!authorizationTriggeredSubmission) {
         try {
-          submitted = await Promise.race([
-            submitPromptWithNativeClick(webview),
-            new Promise<boolean>((_, rej) => setTimeout(() => rej(new Error('提交超时')), 10000)),
-          ]);
+          submitted = canvasMode
+            ? await Promise.race([
+                submitCanvasComposer(webview),
+                new Promise<boolean>((_, rej) => setTimeout(() => rej(new Error('提交超时')), 10000)),
+              ])
+            : await Promise.race([
+                submitPromptWithNativeClick(webview),
+                new Promise<boolean>((_, rej) => setTimeout(() => rej(new Error('提交超时')), 10000)),
+              ]);
         } catch {
           throw new SubmissionSafetyPauseError('发送动作结果不确定，请人工核对豆包会话；系统未自动重发');
         }

@@ -2946,6 +2946,62 @@ export async function clickAITab(webview: WebviewHandle, mode: 'image' | 'video'
 }
 
 /**
+ * 视频模式入口诊断探针。
+ *
+ * clickAITab 失败时调用：导出页面可见状态快照，用于定位新版豆包 UI
+ * 与入口识别启发式的差异。只读，不点击、不修改任何元素。
+ */
+export async function diagnoseVideoModeEntry(webview: WebviewHandle): Promise<string> {
+  const code = `
+    (function() {
+      try {
+        var lines = [];
+        lines.push('viewport=' + window.innerWidth + 'x' + window.innerHeight);
+        var textarea = document.querySelector('textarea');
+        if (textarea) {
+          var tr = textarea.getBoundingClientRect();
+          lines.push('textarea=' + Math.round(tr.left) + ',' + Math.round(tr.top) + ',' + Math.round(tr.width) + 'x' + Math.round(tr.height));
+        } else {
+          lines.push('textarea=none');
+          var ce = document.querySelector('[contenteditable="true"]');
+          if (ce) {
+            var cr = ce.getBoundingClientRect();
+            lines.push('contenteditable=' + Math.round(cr.left) + ',' + Math.round(cr.top) + ',' + Math.round(cr.width) + 'x' + Math.round(cr.height));
+          }
+        }
+        lines.push('url=' + location.pathname);
+        var found = 0;
+        var els = document.querySelectorAll('button, [role="tab"], div, span, a');
+        for (var i = 0; i < els.length && found < 25; i++) {
+          var el = els[i];
+          var text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+          if (!text || text.length >= 20 || (text.indexOf('视频') < 0 && text.indexOf('生成') < 0)) continue;
+          var r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) continue;
+          lines.push('el[' + el.tagName + ']"' + text.substring(0, 18) + '"@' + Math.round(r.left) + ',' + Math.round(r.top) + ' ' + Math.round(r.width) + 'x' + Math.round(r.height));
+          found++;
+        }
+        if (found === 0) lines.push('no-visible-element-contains-视频/生成');
+        var model = document.querySelector('[data-input-engine-actionbar-control-key="video-model"]');
+        lines.push('video-model-control=' + (model ? 'present' : 'absent'));
+        var composite = document.querySelector('[data-creation-params-panel-id]');
+        lines.push('composite-control=' + (composite ? 'present' : 'absent'));
+        var modeTrigger = document.querySelector('[data-valid-btn="mode-select-action-btn"]');
+        lines.push('mode-trigger=' + (modeTrigger ? 'present' : 'absent'));
+        return lines.join(' | ');
+      } catch (e) {
+        return 'diagnose-error: ' + e.message;
+      }
+    })();
+  `;
+  try {
+    return await safeExecuteJS<string>(webview, code, 5000, 'diagnose_video_mode_entry');
+  } catch (err: any) {
+    return `diagnose-unavailable: ${err?.message || err}`;
+  }
+}
+
+/**
  * 等待模式切换完成（页面重新加载 + DOM 就绪）
  */
 export async function waitForModeReady(
@@ -4955,6 +5011,620 @@ export async function startNewConversation(webview: WebviewHandle, readinessTime
   } catch (err: any) {
     console.warn('[doubaoBridge] 创建新对话失败:', err.message);
     return { ok: false, reason: 'EXECUTION_FAILED' };
+  }
+}
+
+// ==================== 画布视频生成通道（兼容飞书登录态 UI） ====================
+//
+// 背景：飞书扫码登录的豆包 web 是另一套界面，composer 没有「视频生成」入口。
+// 可用路径：composer「技能」→「打开画布/创建画布」→ 画布工具条「视频生成」
+// → 画布视频节点（+参考图 / 模型 / 比例 / 时长滑块 / 提示词 → Enter 生成）。
+// 画布工具条按钮带稳定 aria-label（无限画布/上传文件/图片生成/视频生成），
+// 是可靠的自动化锚点；时长滑块与旧聊天 UI 同构（aria-valuemin=0, max=11）。
+
+export interface CanvasFlowResult {
+  ok: boolean;
+  error?: string;
+}
+
+/** 画布编辑器是否已打开（右侧无限画布面板）。 */
+export async function isCanvasEditorOpen(webview: WebviewHandle): Promise<boolean> {
+  try {
+    return await safeExecuteJS<boolean>(
+      webview,
+      `Boolean(document.querySelector('[aria-label="无限画布"]'))`,
+      3000,
+      'isCanvasEditorOpen',
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** 快速探测标准聊天 composer 是否存在「视频生成」入口（3.5s 内）。 */
+export async function probeStandardVideoEntry(
+  webview: WebviewHandle,
+  timeoutMs: number = 3500,
+): Promise<boolean> {
+  const code = `
+    (async function() {
+      function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+      var deadline = Date.now() + ${timeoutMs};
+      while (Date.now() < deadline) {
+        var els = document.querySelectorAll('button, [role="tab"], div, span, a');
+        for (var i = 0; i < els.length; i++) {
+          var el = els[i];
+          var t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+          if (t.length >= 20 || t.indexOf('视频生成') < 0) continue;
+          var r = el.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0 && r.top >= 0 && r.left > 200) return true;
+        }
+        await sleep(250);
+      }
+      return false;
+    })()
+  `;
+  try {
+    return await safeExecuteJS<boolean>(webview, code, timeoutMs + 5000, 'probeStandardVideoEntry');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 打开画布视频节点编辑器：
+ * 确保画布面板打开（composer 技能 → 打开画布/创建画布），
+ * 然后点击画布工具条「视频生成」并等待节点配置条挂载。
+ */
+export async function openCanvasVideoComposer(webview: WebviewHandle): Promise<CanvasFlowResult> {
+  const code = `
+    (async function() {
+      function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+      function visible(el) {
+        if (!el) return false;
+        var r = el.getBoundingClientRect();
+        var s = window.getComputedStyle(el);
+        return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
+      }
+      function activate(el) {
+        if (!el) return false;
+        var r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        var x = Math.round(r.left + r.width / 2);
+        var y = Math.round(r.top + r.height / 2);
+        var opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+        try { el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
+        el.dispatchEvent(new MouseEvent('mousedown', opts));
+        try { el.dispatchEvent(new PointerEvent('pointerup', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
+        el.dispatchEvent(new MouseEvent('mouseup', opts));
+        el.dispatchEvent(new MouseEvent('click', opts));
+        return true;
+      }
+      function composerVideoControlsReady() {
+        var buttons = document.querySelectorAll('button');
+        var hasChip = false, hasModel = false, hasDuration = false;
+        for (var i = 0; i < buttons.length; i++) {
+          var t = (buttons[i].innerText || '').replace(/\\s+/g, ' ').trim();
+          if (!buttons[i].getAttribute('aria-label') && t === '视频生成') hasChip = true;
+          if (t.indexOf('模型 Seedance') === 0 || t.indexOf('模型 ') === 0) hasModel = true;
+          if (/^(自动|\\d+)\\s*·\\s*\\d+s$/.test(t)) hasDuration = true;
+        }
+        return hasChip && hasModel && hasDuration;
+      }
+      async function waitForComposerControls(timeoutMs) {
+        var deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          if (composerVideoControlsReady()) return null;
+          await sleep(300);
+        }
+        return '视频节点配置条未在等待窗口内挂载';
+      }
+      try {
+        // 0. 画布编辑器已开且视频节点已就位 → 直接成功
+        var canvasEditor = document.querySelector('[aria-label="无限画布"]');
+        if (canvasEditor && composerVideoControlsReady()) return { ok: true, reused: true };
+
+        // 1. 确保画布编辑器打开
+        if (!canvasEditor) {
+          var skillBtn = null;
+          var buttons = document.querySelectorAll('button, [role="button"], div');
+          for (var i = 0; i < buttons.length; i++) {
+            var el = buttons[i];
+            if (!visible(el)) continue;
+            var t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+            if (t === '技能' && !el.getAttribute('aria-label')) { skillBtn = el; break; }
+          }
+          if (!skillBtn) return { ok: false, error: '未找到 composer「技能」按钮' };
+          activate(skillBtn);
+          // 2. 等技能菜单出现并点击「打开画布/创建画布」
+          var menuItem = null;
+          var menuDeadline = Date.now() + 8000;
+          while (Date.now() < menuDeadline && !menuItem) {
+            var items = document.querySelectorAll('button, [role="menuitem"], [role="option"], div');
+            for (var j = 0; j < items.length; j++) {
+              var it = items[j];
+              if (!visible(it)) continue;
+              var itText = (it.innerText || '').replace(/\\s+/g, ' ').trim();
+              if (itText.indexOf('打开画布') === 0 || itText.indexOf('创建画布') === 0) { menuItem = it; break; }
+            }
+            if (!menuItem) await sleep(250);
+          }
+          if (!menuItem) return { ok: false, error: '技能菜单中未找到「打开画布/创建画布」' };
+          activate(menuItem);
+          // 3. 等画布编辑器挂载
+          var editorDeadline = Date.now() + 15000;
+          while (Date.now() < editorDeadline) {
+            if (document.querySelector('[aria-label="无限画布"]')) break;
+            await sleep(300);
+          }
+          if (!document.querySelector('[aria-label="无限画布"]')) return { ok: false, error: '画布编辑器未在等待窗口内打开' };
+          await sleep(800);
+        }
+
+        // 4. 点击画布工具条「视频生成」
+        var videoTool = document.querySelector('[aria-label="视频生成"]');
+        if (!videoTool) return { ok: false, error: '画布工具条未找到「视频生成」按钮' };
+        activate(videoTool);
+        // 5. 等视频节点配置条挂载
+        var err = await waitForComposerControls(15000);
+        if (err) return { ok: false, error: err };
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, error: e.message };
+      }
+    })()
+  `;
+  try {
+    const result = await safeExecuteJS<CanvasFlowResult & { reused?: boolean }>(webview, code, 60000, 'openCanvasVideoComposer');
+    if (result.ok) {
+      console.log(`[doubaoBridge] 画布视频节点就绪${result.reused ? '（复用已有节点）' : ''}`);
+      return { ok: true };
+    }
+    console.warn('[doubaoBridge] 打开画布视频节点失败:', result.error);
+    return { ok: false, error: result.error };
+  } catch (err: any) {
+    console.error('[doubaoBridge] openCanvasVideoComposer 异常:', err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+/**
+ * 配置画布视频节点参数（模型 / 比例 / 时长），仅使用页面可见控件。
+ * 画布模型菜单中带「升级」标记的选项属于会员权益，命中时以 membership_required 停止。
+ */
+export async function configureCanvasVideoOptions(
+  webview: WebviewHandle,
+  config: { model: string; aspectRatio: string; duration: string },
+): Promise<CanvasFlowResult> {
+  const modelLabel = getVideoModelUiLabel(config.model) || config.model;
+  const durationSec = Number.parseInt(config.duration, 10);
+  if (!Number.isInteger(durationSec) || durationSec < 4 || durationSec > 15) {
+    return { ok: false, error: `无效的视频时长: ${config.duration}` };
+  }
+  const code = `
+    (async function() {
+      function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+      function normText(el) { return (el.innerText || '').replace(/\\s+/g, ' ').trim(); }
+      function visible(el) {
+        if (!el) return false;
+        var r = el.getBoundingClientRect();
+        var s = window.getComputedStyle(el);
+        return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
+      }
+      function activate(el) {
+        if (!el) return false;
+        var r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        var x = Math.round(r.left + r.width / 2);
+        var y = Math.round(r.top + r.height / 2);
+        var opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+        try { el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
+        el.dispatchEvent(new MouseEvent('mousedown', opts));
+        try { el.dispatchEvent(new PointerEvent('pointerup', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
+        el.dispatchEvent(new MouseEvent('mouseup', opts));
+        el.dispatchEvent(new MouseEvent('click', opts));
+        return true;
+      }
+      function pressEscape() {
+        var opts = { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true };
+        document.activeElement && document.activeElement.dispatchEvent(new KeyboardEvent('keydown', opts));
+        document.dispatchEvent(new KeyboardEvent('keydown', opts));
+      }
+      function findModelTrigger() {
+        var buttons = document.querySelectorAll('button');
+        for (var i = 0; i < buttons.length; i++) {
+          if (!visible(buttons[i])) continue;
+          var t = normText(buttons[i]);
+          if (t.indexOf('模型 ') === 0 && t.indexOf('Seedance') >= 0) return buttons[i];
+        }
+        return null;
+      }
+      function modelLabelMatch(text, label) {
+        if (text === label) return true;
+        if (text.indexOf(label) !== 0) return false;
+        var next = text.charAt(label.length);
+        return !(/[A-Za-z0-9.]/.test(next));
+      }
+      var MODEL_LABEL = ${JSON.stringify(modelLabel)};
+      var RATIO = ${JSON.stringify(config.aspectRatio)};
+      var DURATION_SEC = ${durationSec};
+      try {
+        // ---- 1. 模型 ----
+        var trigger = findModelTrigger();
+        if (!trigger) return { ok: false, error: '未找到画布视频节点「模型」按钮' };
+        if (normText(trigger).indexOf(MODEL_LABEL) < 0) {
+          activate(trigger);
+          var item = null, itemUpgrade = false;
+          var deadline = Date.now() + 8000;
+          while (Date.now() < deadline && !item) {
+            var cands = document.querySelectorAll('button, [role="menuitem"], [role="option"], div, span');
+            var best = null, bestArea = Infinity, bestUpgrade = false;
+            for (var i = 0; i < cands.length; i++) {
+              var el = cands[i];
+              if (!visible(el)) continue;
+              var t = normText(el);
+              if (!t || t.length > 60 || !modelLabelMatch(t, MODEL_LABEL)) continue;
+              var r = el.getBoundingClientRect();
+              var area = r.width * r.height;
+              if (area < bestArea) { best = el; bestArea = area; bestUpgrade = t.indexOf('升级') >= 0; }
+            }
+            if (best) { item = best; itemUpgrade = bestUpgrade; break; }
+            await sleep(250);
+          }
+          if (!item) return { ok: false, error: '模型菜单中未找到 ' + MODEL_LABEL };
+          if (itemUpgrade) {
+            pressEscape();
+            return { ok: false, error: 'membership_required: ' + MODEL_LABEL + ' 需要会员权益，已停止提交' };
+          }
+          activate(item);
+          var verifyDeadline = Date.now() + 8000;
+          while (Date.now() < verifyDeadline) {
+            var t2 = findModelTrigger() ? normText(findModelTrigger()) : '';
+            if (t2.indexOf(MODEL_LABEL) >= 0) break;
+            await sleep(300);
+          }
+          var finalModelText = findModelTrigger() ? normText(findModelTrigger()) : '';
+          if (finalModelText.indexOf(MODEL_LABEL) < 0) return { ok: false, error: '模型选择未回读确认: ' + finalModelText };
+        }
+        await sleep(400);
+
+        // ---- 2 & 3. 比例 + 时长（同一面板） ----
+        var durationTrigger = null;
+        var buttons2 = document.querySelectorAll('button');
+        for (var k = 0; k < buttons2.length; k++) {
+          if (!visible(buttons2[k])) continue;
+          var t3 = normText(buttons2[k]);
+          if (/^(自动|\\d+)\\s*·\\s*\\d+s$/.test(t3)) { durationTrigger = buttons2[k]; break; }
+        }
+        if (!durationTrigger) return { ok: false, error: '未找到画布「比例/时长」按钮' };
+        activate(durationTrigger);
+        // 等比例面板出现（包含时长滑杆）
+        var slider = null;
+        var panelDeadline = Date.now() + 8000;
+        while (Date.now() < panelDeadline && !slider) {
+          var sliders = document.querySelectorAll('[role="slider"]');
+          for (var m = 0; m < sliders.length; m++) {
+            if (sliders[m].getAttribute('aria-valuemin') === '0' && sliders[m].getAttribute('aria-valuemax') === '11') { slider = sliders[m]; break; }
+          }
+          if (!slider) await sleep(250);
+        }
+        if (!slider) return { ok: false, error: '时长滑杆未在面板中挂载' };
+        // 比例：精确文本匹配（跳过滑杆面板外元素）
+        var ratioEl = null;
+        var ratioCands = document.querySelectorAll('button, div, span');
+        var ratioBest = null, ratioBestArea = Infinity;
+        for (var n = 0; n < ratioCands.length; n++) {
+          var rel = ratioCands[n];
+          if (!visible(rel)) continue;
+          if (normText(rel) !== RATIO) continue;
+          var rr = rel.getBoundingClientRect();
+          var rArea = rr.width * rr.height;
+          if (rArea < ratioBestArea) { ratioBest = rel; ratioBestArea = rArea; }
+        }
+        ratioEl = ratioBest;
+        if (!ratioEl) return { ok: false, error: '比例面板中未找到 ' + RATIO };
+        activate(ratioEl);
+        await sleep(400);
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, error: e.message };
+      }
+    })()
+  `;
+  try {
+    const result = await safeExecuteJS<CanvasFlowResult>(webview, code, 60000, 'configureCanvasVideoOptions');
+    if (!result.ok) {
+      console.warn('[doubaoBridge] 画布视频参数配置失败:', result.error);
+      return result;
+    }
+  } catch (err: any) {
+    return { ok: false, error: err.message };
+  }
+
+  // 时长滑杆：原生键入（Home 到起点，再按次数右移），与聊天通道同构
+  if (typeof webview.sendInputEvent === 'function') {
+    const sliderPos = await safeExecuteJS<{ pos?: string }>(
+      webview,
+      `
+      (function() {
+        var sliders = document.querySelectorAll('[role="slider"]');
+        for (var i = 0; i < sliders.length; i++) {
+          var el = sliders[i];
+          if (el.getAttribute('aria-valuemin') === '0' && el.getAttribute('aria-valuemax') === '11') {
+            var r = el.getBoundingClientRect();
+            if (r.width <= 0) continue;
+            el.focus();
+            return { pos: Math.round(r.left + r.width / 2) + ',' + Math.round(r.top + r.height / 2) };
+          }
+        }
+        return {};
+      })()
+      `,
+      3000,
+      'findCanvasDurationSlider',
+    ).catch(() => ({}) as { pos?: string });
+    if (sliderPos.pos) {
+      const [sx, sy] = sliderPos.pos.split(',').map(Number);
+      if (Number.isFinite(sx) && Number.isFinite(sy)) {
+        webview.sendInputEvent({ type: 'mouseMove', x: sx, y: sy });
+        webview.sendInputEvent({ type: 'mouseDown', x: sx, y: sy, button: 'left', clickCount: 1 });
+        webview.sendInputEvent({ type: 'mouseUp', x: sx, y: sy, button: 'left', clickCount: 1 });
+        webview.sendInputEvent({ type: 'keyDown', keyCode: 'Home' });
+        webview.sendInputEvent({ type: 'keyUp', keyCode: 'Home' });
+        for (let step = 0; step < durationSec - 4; step += 1) {
+          webview.sendInputEvent({ type: 'keyDown', keyCode: 'Right' });
+          webview.sendInputEvent({ type: 'keyUp', keyCode: 'Right' });
+        }
+      }
+    }
+    await sleep(400);
+    // 关闭参数面板
+    webview.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
+    webview.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
+  }
+  await sleep(300);
+
+  // 回读验证
+  try {
+    const verify = await safeExecuteJS<{ modelOk: boolean; durationOk: boolean; texts: string }>(
+      webview,
+      `
+      (function() {
+        var modelOk = false, durationOk = false;
+        var texts = [];
+        var buttons = document.querySelectorAll('button');
+        for (var i = 0; i < buttons.length; i++) {
+          var t = (buttons[i].innerText || '').replace(/\\s+/g, ' ').trim();
+          if (t.indexOf('模型 ') === 0 && t.indexOf(${JSON.stringify(modelLabel)}) >= 0) modelOk = true;
+          if (/^(自动|\\d+)\\s*·\\s*\\d+s$/.test(t)) { texts.push(t); if (t.indexOf(${JSON.stringify(`${durationSec}s`)}) >= 0) durationOk = true; }
+        }
+        var sliders = document.querySelectorAll('[role="slider"]');
+        for (var j = 0; j < sliders.length; j++) {
+          if (sliders[j].getAttribute('aria-valuemin') === '0' && sliders[j].getAttribute('aria-valuemax') === '11'
+            && Number(sliders[j].getAttribute('aria-valuenow')) === ${durationSec - 4}) durationOk = true;
+        }
+        return { modelOk: modelOk, durationOk: durationOk, texts: texts.join('|') };
+      })()
+      `,
+      4000,
+      'verifyCanvasVideoOptions',
+    );
+    if (!verify.modelOk || !verify.durationOk) {
+      return { ok: false, error: `画布参数回读不一致: model=${verify.modelOk}, duration=${verify.durationOk} (${verify.texts})` };
+    }
+    return { ok: true };
+  } catch (err: any) {
+    return { ok: false, error: `画布参数回读异常: ${err.message}` };
+  }
+}
+
+/**
+ * 点击画布视频节点配置条的「+」，促使上传文件输入框挂载。
+ * 之后可复用 uploadReferenceImages 的 DataTransfer 注入。
+ */
+export async function openCanvasUploadPicker(webview: WebviewHandle): Promise<CanvasFlowResult> {
+  const code = `
+    (async function() {
+      function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+      function visible(el) {
+        if (!el) return false;
+        var r = el.getBoundingClientRect();
+        return r.width > 2 && r.height > 2;
+      }
+      function activate(el) {
+        if (!el) return false;
+        var r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        var x = Math.round(r.left + r.width / 2);
+        var y = Math.round(r.top + r.height / 2);
+        var opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+        try { el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
+        el.dispatchEvent(new MouseEvent('mousedown', opts));
+        try { el.dispatchEvent(new PointerEvent('pointerup', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
+        el.dispatchEvent(new MouseEvent('mouseup', opts));
+        el.dispatchEvent(new MouseEvent('click', opts));
+        return true;
+      }
+      try {
+        function findComposerContainer() {
+          var buttons = document.querySelectorAll('button');
+          for (var i = 0; i < buttons.length; i++) {
+            var b = buttons[i];
+            if (!visible(b) || b.getAttribute('aria-label')) continue;
+            if ((b.innerText || '').replace(/\\s+/g, ' ').trim() !== '视频生成') continue;
+            var root = b;
+            for (var d = 0; d < 10 && root.parentElement; d++) {
+              root = root.parentElement;
+              if (root.querySelector('button') && Array.from(root.querySelectorAll('button')).some(function(x) {
+                return ((x.innerText || '')).indexOf('模型 ') === 0;
+              })) return root;
+            }
+          }
+          return null;
+        }
+        var container = findComposerContainer();
+        if (!container) return { ok: false, error: '未找到画布视频配置条容器' };
+        var plus = null;
+        var cands = container.querySelectorAll('button');
+        for (var j = 0; j < cands.length; j++) {
+          var el = cands[j];
+          if (!visible(el)) continue;
+          var t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+          if (t === '' && !el.getAttribute('aria-label')) { plus = el; break; }
+        }
+        if (!plus) return { ok: false, error: '未找到配置条「+」按钮' };
+        activate(plus);
+        // 等待 file input 挂载
+        var deadline = Date.now() + 5000;
+        while (Date.now() < deadline) {
+          var inputs = document.querySelectorAll('input[type="file"]');
+          for (var k = 0; k < inputs.length; k++) {
+            if (visible(inputs[k]) || inputs[k].files) return { ok: true };
+          }
+          await sleep(250);
+        }
+        return { ok: false, error: '点击「+」后文件输入框未挂载' };
+      } catch (e) {
+        return { ok: false, error: e.message };
+      }
+    })()
+  `;
+  try {
+    return await safeExecuteJS<CanvasFlowResult>(webview, code, 15000, 'openCanvasUploadPicker');
+  } catch (err: any) {
+    return { ok: false, error: err.message };
+  }
+}
+
+/** 把提示词注入画布视频节点编辑器并回读验证。 */
+export async function injectCanvasPrompt(webview: WebviewHandle, prompt: string): Promise<boolean> {
+  const code = `
+    (async function() {
+      function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+      function visible(el) {
+        if (!el) return false;
+        var r = el.getBoundingClientRect();
+        return r.width > 4 && r.height > 4;
+      }
+      function findEditor() {
+        var buttons = document.querySelectorAll('button');
+        for (var i = 0; i < buttons.length; i++) {
+          var b = buttons[i];
+          if (!visible(b) || b.getAttribute('aria-label')) continue;
+          if ((b.innerText || '').replace(/\\s+/g, ' ').trim() !== '视频生成') continue;
+          var root = b;
+          for (var d = 0; d < 10 && root.parentElement; d++) {
+            root = root.parentElement;
+            var editors = root.querySelectorAll('[contenteditable="true"], textarea');
+            for (var e = 0; e < editors.length; e++) {
+              if (visible(editors[e])) return editors[e];
+            }
+          }
+        }
+        return null;
+      }
+      var editor = findEditor();
+      if (!editor) return { ok: false, error: '未找到画布提示词编辑器' };
+      editor.focus();
+      var selection = window.getSelection();
+      if (selection) {
+        var range = document.createRange();
+        range.selectNodeContents(editor);
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+      var PROMPT = ${JSON.stringify(prompt)};
+      var inserted = false;
+      try {
+        inserted = document.execCommand('insertText', false, PROMPT);
+      } catch (_) { inserted = false; }
+      if (!inserted) {
+        // 兜底：逐字符 InputEvent
+        for (var c = 0; c < PROMPT.length; c++) {
+          editor.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, data: PROMPT[c], inputType: 'insertText' }));
+          editor.dispatchEvent(new InputEvent('input', { bubbles: true, data: PROMPT[c], inputType: 'insertText' }));
+        }
+      }
+      await sleep(300);
+      var current = (editor.innerText || editor.textContent || '').trim();
+      if (current.indexOf(PROMPT.trim()) < 0 && current.length < 10) {
+        return { ok: false, error: '提示词注入后回读不一致: ' + current.substring(0, 40) };
+      }
+      return { ok: true, readback: current.substring(0, 60) };
+    })()
+  `;
+  try {
+    const result = await safeExecuteJS<{ ok: boolean; error?: string; readback?: string }>(
+      webview, code, 20000, 'injectCanvasPrompt',
+    );
+    if (result.ok) {
+      console.log(`[doubaoBridge] 画布提示词已注入: ${result.readback || ''}`);
+      return true;
+    }
+    console.warn('[doubaoBridge] 画布提示词注入失败:', result.error);
+    return false;
+  } catch (err: any) {
+    console.error('[doubaoBridge] injectCanvasPrompt 异常:', err.message);
+    return false;
+  }
+}
+
+/** 在画布提示词编辑器中按下 Enter 提交生成。 */
+export async function submitCanvasComposer(webview: WebviewHandle): Promise<boolean> {
+  const code = `
+    (function() {
+      function visible(el) {
+        if (!el) return false;
+        var r = el.getBoundingClientRect();
+        return r.width > 4 && r.height > 4;
+      }
+      function findEditor() {
+        var buttons = document.querySelectorAll('button');
+        for (var i = 0; i < buttons.length; i++) {
+          var b = buttons[i];
+          if (!visible(b) || b.getAttribute('aria-label')) continue;
+          if ((b.innerText || '').replace(/\\s+/g, ' ').trim() !== '视频生成') continue;
+          var root = b;
+          for (var d = 0; d < 10 && root.parentElement; d++) {
+            root = root.parentElement;
+            var editors = root.querySelectorAll('[contenteditable="true"], textarea');
+            for (var e = 0; e < editors.length; e++) {
+              if (visible(editors[e])) return editors[e];
+            }
+          }
+        }
+        return null;
+      }
+      var editor = findEditor();
+      if (!editor) return { ok: false, error: '未找到画布提示词编辑器' };
+      var r = editor.getBoundingClientRect();
+      editor.focus();
+      return { ok: true, pos: Math.round(r.left + r.width / 2) + ',' + Math.round(r.bottom - 12) };
+    })()
+  `;
+  try {
+    const result = await safeExecuteJS<{ ok: boolean; pos?: string; error?: string }>(
+      webview, code, 8000, 'findCanvasComposerForSubmit',
+    );
+    if (!result.ok || !result.pos) {
+      console.warn('[doubaoBridge] 画布提交定位失败:', result.error);
+      return false;
+    }
+    if (typeof webview.sendInputEvent !== 'function') return false;
+    const [x, y] = result.pos.split(',').map(Number);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+    webview.sendInputEvent({ type: 'mouseMove', x, y });
+    webview.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+    webview.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+    await sleep(200);
+    webview.sendInputEvent({ type: 'keyDown', keyCode: 'Enter' });
+    webview.sendInputEvent({ type: 'keyUp', keyCode: 'Enter' });
+    console.log('[doubaoBridge] 画布视频生成已提交（Enter）');
+    return true;
+  } catch (err: any) {
+    console.error('[doubaoBridge] submitCanvasComposer 异常:', err.message);
+    return false;
   }
 }
 
