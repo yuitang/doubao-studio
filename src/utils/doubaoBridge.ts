@@ -5396,7 +5396,9 @@ export async function configureCanvasVideoOptions(
         }
         await sleep(400);
 
-        // ---- 2 & 3. 比例 + 时长（同一面板） ----
+        // ---- 2. 打开「比例/时长」面板并等待滑杆挂载 ----
+        // 注意：必须先设时长、后点比例——实测选中比例后面板会立即收起，
+        // 滑杆从 DOM 消失，之后再设置时长就无从下手。
         var durationTrigger = null;
         var buttons2 = document.querySelectorAll('button');
         for (var k = 0; k < buttons2.length; k++) {
@@ -5417,22 +5419,6 @@ export async function configureCanvasVideoOptions(
           if (!slider) await sleep(250);
         }
         if (!slider) return { ok: false, error: '时长滑杆未在面板中挂载' };
-        // 比例：精确文本匹配（跳过滑杆面板外元素）
-        var ratioEl = null;
-        var ratioCands = document.querySelectorAll('button, div, span');
-        var ratioBest = null, ratioBestArea = Infinity;
-        for (var n = 0; n < ratioCands.length; n++) {
-          var rel = ratioCands[n];
-          if (!visible(rel)) continue;
-          if (normText(rel) !== RATIO) continue;
-          var rr = rel.getBoundingClientRect();
-          var rArea = rr.width * rr.height;
-          if (rArea < ratioBestArea) { ratioBest = rel; ratioBestArea = rArea; }
-        }
-        ratioEl = ratioBest;
-        if (!ratioEl) return { ok: false, error: '比例面板中未找到 ' + RATIO };
-        activate(ratioEl);
-        await sleep(400);
         return { ok: true };
       } catch (e) {
         return { ok: false, error: e.message };
@@ -5458,8 +5444,9 @@ export async function configureCanvasVideoOptions(
     const durationOk = await (async (): Promise<boolean> => {
       const MAX_ATTEMPTS = 3;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-        // 取滑杆手柄与轨道（手柄的定位父级）信息，用于直接点击目标位置
-        const sliderInfo = await safeExecuteJS<{ pos?: string; track?: string; now?: string }>(
+        // 取滑杆手柄与轨道（手柄的定位父级）信息，用于直接点击目标位置。
+        // 面板可能在上一次尝试后收起（比例选中/误点），先确保滑杆存在。
+        let sliderInfo = await safeExecuteJS<{ pos?: string; track?: string; now?: string }>(
           webview,
           `
           (function() {
@@ -5489,6 +5476,89 @@ export async function configureCanvasVideoOptions(
           3000,
           'findCanvasDurationSlider',
         ).catch(() => ({}) as { pos?: string; track?: string; now?: string });
+        // 滑杆不在 DOM（面板已收起）→ 重新点击「比例/时长」按钮打开面板
+        if (!sliderInfo.pos) {
+          const reopened = await safeExecuteJS<{ ok: boolean }>(
+            webview,
+            `
+            (async function() {
+              function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+              function visible(el) {
+                if (!el) return false;
+                var r = el.getBoundingClientRect();
+                var s = window.getComputedStyle(el);
+                return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
+              }
+              function activate(el) {
+                if (!el) return false;
+                var r = el.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) return false;
+                var x = Math.round(r.left + r.width / 2);
+                var y = Math.round(r.top + r.height / 2);
+                var opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+                try { el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
+                el.dispatchEvent(new MouseEvent('mousedown', opts));
+                try { el.dispatchEvent(new PointerEvent('pointerup', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
+                el.dispatchEvent(new MouseEvent('mouseup', opts));
+                el.dispatchEvent(new MouseEvent('click', opts));
+                return true;
+              }
+              var trigger = null;
+              var buttons = document.querySelectorAll('button');
+              for (var i = 0; i < buttons.length; i++) {
+                if (!visible(buttons[i])) continue;
+                var t = (buttons[i].innerText || '').replace(/\\s+/g, ' ').trim();
+                if (/^(自动|\\d+)\\s*·\\s*\\d+s$/.test(t)) { trigger = buttons[i]; break; }
+              }
+              if (!trigger) return { ok: false };
+              activate(trigger);
+              var deadline = Date.now() + 6000;
+              while (Date.now() < deadline) {
+                var sliders = document.querySelectorAll('[role="slider"]');
+                for (var j = 0; j < sliders.length; j++) {
+                  if (sliders[j].getAttribute('aria-valuemin') === '0' && sliders[j].getAttribute('aria-valuemax') === '11') return { ok: true };
+                }
+                await sleep(250);
+              }
+              return { ok: false };
+            })()
+            `,
+            10000,
+            'reopenCanvasDurationPanel',
+          ).catch(() => ({ ok: false }));
+          if (!reopened.ok) {
+            lastDiag = `面板重开失败(第${attempt}次)`;
+            continue;
+          }
+          sliderInfo = await safeExecuteJS<{ pos?: string; track?: string; now?: string }>(
+            webview,
+            `
+            (function() {
+              var sliders = document.querySelectorAll('[role="slider"]');
+              for (var i = 0; i < sliders.length; i++) {
+                var el = sliders[i];
+                if (el.getAttribute('aria-valuemin') === '0' && el.getAttribute('aria-valuemax') === '11') {
+                  var r = el.getBoundingClientRect();
+                  if (r.width <= 0) continue;
+                  el.focus();
+                  var track = el.parentElement;
+                  for (var up = 0; track && up < 4; up++) {
+                    if (track.getBoundingClientRect().width >= r.width * 2) break;
+                    track = track.parentElement;
+                  }
+                  var tr = track ? track.getBoundingClientRect() : r;
+                  return { pos: Math.round(r.left + r.width / 2) + ',' + Math.round(r.top + r.height / 2),
+                    track: Math.round(tr.left) + ',' + Math.round(tr.right) + ',' + Math.round(tr.top + tr.height / 2),
+                    now: String(el.getAttribute('aria-valuenow') || '') };
+                }
+              }
+              return {};
+            })()
+            `,
+            3000,
+            'findCanvasDurationSlider',
+          ).catch(() => ({}) as { pos?: string; track?: string; now?: string });
+        }
         lastDiag = `valuenow=${sliderInfo.now || '?'}`;
         if (sliderInfo.pos) {
           const [sx, sy] = sliderInfo.pos.split(',').map(Number);
@@ -5580,9 +5650,74 @@ export async function configureCanvasVideoOptions(
     if (!durationOk) {
       return { ok: false, error: `画布时长滑杆设置未回读确认（目标 ${durationSec}s；${lastDiag}）` };
     }
-    // 验证通过后再关面板
-    sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
-    sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
+    // 时长就位后最后点比例——选中后面板会收起，所以必须放在最后
+    const ratioResult = await safeExecuteJS<{ ok: boolean; error?: string }>(
+      webview,
+      `
+      (function() {
+        function normText(el) { return (el.innerText || '').replace(/\\s+/g, ' ').trim(); }
+        function visible(el) {
+          if (!el) return false;
+          var r = el.getBoundingClientRect();
+          var s = window.getComputedStyle(el);
+          return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
+        }
+        function activate(el) {
+          if (!el) return false;
+          var r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          var x = Math.round(r.left + r.width / 2);
+          var y = Math.round(r.top + r.height / 2);
+          var opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+          try { el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
+          el.dispatchEvent(new MouseEvent('mousedown', opts));
+          try { el.dispatchEvent(new PointerEvent('pointerup', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
+          el.dispatchEvent(new MouseEvent('mouseup', opts));
+          el.dispatchEvent(new MouseEvent('click', opts));
+          return true;
+        }
+        var RATIO = ${JSON.stringify(config.aspectRatio)};
+        var ratioCands = document.querySelectorAll('button, div, span');
+        var best = null, bestArea = Infinity;
+        for (var i = 0; i < ratioCands.length; i++) {
+          var el = ratioCands[i];
+          if (!visible(el)) continue;
+          if (normText(el) !== RATIO) continue;
+          var r = el.getBoundingClientRect();
+          var area = r.width * r.height;
+          if (area < bestArea) { best = el; bestArea = area; }
+        }
+        if (!best) return { ok: false, error: '比例面板中未找到 ' + RATIO };
+        activate(best);
+        return { ok: true };
+      })()
+      `,
+      5000,
+      'clickCanvasRatio',
+    ).catch(() => ({ ok: false, error: '比例点击异常' }));
+    if (!ratioResult.ok) {
+      return { ok: false, error: ratioResult.error || '画布比例设置失败' };
+    }
+    await sleep(400);
+    // 若面板仍未收起（滑杆还在 DOM），发 Escape 关闭；已收起则不再打扰
+    const panelStillOpen = await safeExecuteJS<{ open: boolean }>(
+      webview,
+      `
+      (function() {
+        var sliders = document.querySelectorAll('[role="slider"]');
+        for (var i = 0; i < sliders.length; i++) {
+          if (sliders[i].getAttribute('aria-valuemin') === '0' && sliders[i].getAttribute('aria-valuemax') === '11') return { open: true };
+        }
+        return { open: false };
+      })()
+      `,
+      3000,
+      'checkCanvasPanelOpen',
+    ).catch(() => ({ open: false }));
+    if (panelStillOpen.open) {
+      sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
+      sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
+    }
   } else {
     // 无法发送原生键盘事件时，尝试用 JS 键盘事件驱动滑杆
     await safeExecuteJS<{ ok: boolean }>(
