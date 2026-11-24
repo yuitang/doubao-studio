@@ -5179,32 +5179,54 @@ export async function openCanvasVideoComposer(webview: WebviewHandle): Promise<C
 
         // 1. 确保画布编辑器打开
         if (!canvasEditor) {
+          // 「技能」按钮结构可能是 <button><icon/><span>技能</span></button>：
+          // 文本在叶子 span 里而按钮本身不是叶子。收集所有文本命中元素，
+          // 选包围盒最小（最深层）的那个点击，避免点到外层容器导致坐标落偏。
           var skillBtn = null;
-          var buttons = document.querySelectorAll('button, [role="button"], div');
+          var skillArea = Infinity;
+          var buttons = document.querySelectorAll('button, [role="button"], div, span, a, p, li');
           for (var i = 0; i < buttons.length; i++) {
             var el = buttons[i];
             if (!visible(el)) continue;
             var t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-            if (t === '技能' && !el.getAttribute('aria-label') && isLeafWithText(el, '技能')) { skillBtn = el; break; }
+            if (t !== '技能' || el.getAttribute('aria-label')) continue;
+            var r = el.getBoundingClientRect();
+            var area = r.width * r.height;
+            if (area < skillArea) { skillArea = area; skillBtn = el; }
           }
-          if (!skillBtn) return { ok: false, error: '未找到 composer「技能」按钮' };
+          if (!skillBtn) {
+            var diagBtns = [];
+            var allBtns = document.querySelectorAll('button, [role="button"]');
+            for (var bi = 0; bi < allBtns.length && diagBtns.length < 15; bi++) {
+              if (!visible(allBtns[bi])) continue;
+              var bt = (allBtns[bi].innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 20);
+              if (bt) diagBtns.push(bt);
+            }
+            return { ok: false, error: '未找到 composer「技能」按钮；页面可见按钮文本: ' + (diagBtns.length ? diagBtns.join(' | ') : '无') };
+          }
           activate(skillBtn);
           // 2. 等技能菜单出现并点击「打开画布/创建画布」。
-          //    匹配优先级：精确「打开画布/创建画布」开头 → 文本含「画布」且在浮层容器内的短文本项。
+          //    匹配优先级：精确「打开画布/创建画布」开头（取面积最小最深层元素）→ 文本含「画布」且可点。
           var menuItem = null;
           var menuDeadline = Date.now() + 10000;
           var scrolled = false;
           while (Date.now() < menuDeadline && !menuItem) {
-            var items = document.querySelectorAll('button, [role="menuitem"], [role="option"], div, a');
-            // 优先精确匹配
+            var items = document.querySelectorAll('button, [role="menuitem"], [role="option"], div, span, a');
+            // 优先精确匹配：收集所有命中元素，选包围盒最小（最深层）的，避免点到外层容器
+            var exactArea = Infinity;
             for (var j = 0; j < items.length; j++) {
               var it = items[j];
               if (!visible(it)) continue;
               var itText = (it.innerText || '').replace(/\\s+/g, ' ').trim();
-              if ((itText.indexOf('打开画布') === 0 || itText.indexOf('创建画布') === 0) && isLeafWithText(it, itText)) { menuItem = it; break; }
+              if (itText.indexOf('打开画布') === 0 || itText.indexOf('创建画布') === 0) {
+                var ir = it.getBoundingClientRect();
+                var ia = ir.width * ir.height;
+                if (ia < exactArea) { exactArea = ia; menuItem = it; }
+              }
             }
             // 退路：含「画布」的短文本项——浮层菜单项，或技能市场页的可点卡片（排除侧边栏/历史记录）
             if (!menuItem) {
+              var fallbackArea = Infinity;
               for (var j2 = 0; j2 < items.length; j2++) {
                 var it2 = items[j2];
                 if (!visible(it2)) continue;
@@ -5212,7 +5234,10 @@ export async function openCanvasVideoComposer(webview: WebviewHandle): Promise<C
                 if (et2.length > 0 && et2.length <= 24 && et2.indexOf('画布') !== -1 && !insideNavOrHistory(it2)) {
                   var role2 = (it2.getAttribute('role') || '').toLowerCase();
                   var clickable = it2.tagName === 'BUTTON' || role2 === 'button' || role2 === 'menuitem' || it2.tagName === 'A' || insideMenuContainer(it2);
-                  if (clickable) { menuItem = it2; break; }
+                  if (!clickable) continue;
+                  var fr = it2.getBoundingClientRect();
+                  var fa = fr.width * fr.height;
+                  if (fa < fallbackArea) { fallbackArea = fa; menuItem = it2; }
                 }
               }
             }
