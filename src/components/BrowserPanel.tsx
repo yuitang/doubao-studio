@@ -49,6 +49,8 @@ import {
   openCanvasUploadPicker,
   injectCanvasPrompt,
   submitCanvasComposer,
+  detectCanvasSafetyConfirm,
+  waitForCanvasSafetyConfirmResolved,
   detectRobotVerification,
   resolveVideoArtifact,
   manualResolveVideoArtifact,
@@ -1740,6 +1742,20 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
       }
       if (!submitted) {
         throw new SubmissionSafetyPauseError('发送按钮不可用或点击结果不确定；系统已停止且未自动重发');
+      }
+
+      // 画布通道：提交后可能弹出「安全确认」素材授权弹窗，生成在确认前不会开始。
+      // 自动化只识别不代点，提示用户后等待人工确认（有界等待）。
+      if (canvasMode) {
+        const safetyPresent = await detectCanvasSafetyConfirm(webview);
+        if (safetyPresent) {
+          setAccountAutomationState(accountId, 'injecting', '页面出现「安全确认」弹窗，请点击「确认」继续生成...', 'waiting_verification');
+          const resolved = await waitForCanvasSafetyConfirmResolved(webview);
+          if (!resolved) {
+            throw new SubmissionSafetyPauseError('「安全确认」弹窗长时间未确认，任务已暂停；请在页面中确认后重试');
+          }
+          setAccountAutomationState(accountId, 'generating', '安全确认已通过，生成进行中...', 'waiting_generation_confirmation');
+        }
       }
 
       let submissionConfirmed = false;

@@ -5107,7 +5107,7 @@ export async function openCanvasVideoComposer(webview: WebviewHandle): Promise<C
           var t = (buttons[i].innerText || '').replace(/\\s+/g, ' ').trim();
           if (!buttons[i].getAttribute('aria-label') && t === '视频生成') hasChip = true;
           if (t.indexOf('模型 Seedance') === 0 || t.indexOf('模型 ') === 0) hasModel = true;
-          if (/^(自动|\\d+)\\s*·\\s*\\d+s$/.test(t)) hasDuration = true;
+          if (/^\S+\s*·\s*\d+s$/.test(t)) hasDuration = true;
         }
         return hasChip && hasModel && hasDuration;
       }
@@ -5404,7 +5404,7 @@ export async function configureCanvasVideoOptions(
         for (var k = 0; k < buttons2.length; k++) {
           if (!visible(buttons2[k])) continue;
           var t3 = normText(buttons2[k]);
-          if (/^(自动|\\d+)\\s*·\\s*\\d+s$/.test(t3)) { durationTrigger = buttons2[k]; break; }
+          if (/^\S+\s*·\s*\d+s$/.test(t3)) { durationTrigger = buttons2[k]; break; }
         }
         if (!durationTrigger) return { ok: false, error: '未找到画布「比例/时长」按钮' };
         activate(durationTrigger);
@@ -5508,7 +5508,7 @@ export async function configureCanvasVideoOptions(
               for (var i = 0; i < buttons.length; i++) {
                 if (!visible(buttons[i])) continue;
                 var t = (buttons[i].innerText || '').replace(/\\s+/g, ' ').trim();
-                if (/^(自动|\\d+)\\s*·\\s*\\d+s$/.test(t)) { trigger = buttons[i]; break; }
+                if (/^\S+\s*·\s*\d+s$/.test(t)) { trigger = buttons[i]; break; }
               }
               if (!trigger) return { ok: false };
               activate(trigger);
@@ -5631,7 +5631,7 @@ export async function configureCanvasVideoOptions(
             var buttons = document.querySelectorAll('button');
             for (var i = 0; i < buttons.length; i++) {
               var t = (buttons[i].innerText || '').replace(/\\s+/g, ' ').trim();
-              if (/^(自动|\\d+)\\s*·\\s*\\d+s$/.test(t)) { barText = t; break; }
+              if (/^\S+\s*·\s*\d+s$/.test(t)) { barText = t; break; }
             }
             var durationOk = Number(sliderNow) === ${durationSec - 4} || barText.indexOf('${durationSec}s') >= 0;
             return { durationOk: durationOk, sliderNow: sliderNow, barText: barText };
@@ -5651,9 +5651,7 @@ export async function configureCanvasVideoOptions(
       return { ok: false, error: `画布时长滑杆设置未回读确认（目标 ${durationSec}s；${lastDiag}）` };
     }
     // 时长就位后最后点比例——选中后面板会收起，所以必须放在最后
-    const ratioResult = await safeExecuteJS<{ ok: boolean; error?: string }>(
-      webview,
-      `
+    const ratioClickCode = `
       (function() {
         function normText(el) { return (el.innerText || '').replace(/\\s+/g, ' ').trim(); }
         function visible(el) {
@@ -5691,12 +5689,72 @@ export async function configureCanvasVideoOptions(
         activate(best);
         return { ok: true };
       })()
-      `,
+      `;
+    let ratioResult = await safeExecuteJS<{ ok: boolean; error?: string }>(
+      webview,
+      ratioClickCode,
       5000,
       'clickCanvasRatio',
     ).catch(() => ({ ok: false, error: '比例点击异常' }));
     if (!ratioResult.ok) {
-      return { ok: false, error: ratioResult.error || '画布比例设置失败' };
+      // 面板可能已收起：重开面板后重试一次
+      await safeExecuteJS<{ ok: boolean }>(
+        webview,
+        `
+        (async function() {
+          function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+          function visible(el) {
+            if (!el) return false;
+            var r = el.getBoundingClientRect();
+            var s = window.getComputedStyle(el);
+            return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
+          }
+          function activate(el) {
+            if (!el) return false;
+            var r = el.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0) return false;
+            var x = Math.round(r.left + r.width / 2);
+            var y = Math.round(r.top + r.height / 2);
+            var opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+            try { el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
+            el.dispatchEvent(new MouseEvent('mousedown', opts));
+            try { el.dispatchEvent(new PointerEvent('pointerup', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
+            el.dispatchEvent(new MouseEvent('mouseup', opts));
+            el.dispatchEvent(new MouseEvent('click', opts));
+            return true;
+          }
+          var trigger = null;
+          var buttons = document.querySelectorAll('button');
+          for (var i = 0; i < buttons.length; i++) {
+            if (!visible(buttons[i])) continue;
+            var t = (buttons[i].innerText || '').replace(/\\s+/g, ' ').trim();
+            if (/^\\S+\\s*·\\s*\\d+s$/.test(t)) { trigger = buttons[i]; break; }
+          }
+          if (!trigger) return { ok: false };
+          activate(trigger);
+          var deadline = Date.now() + 6000;
+          while (Date.now() < deadline) {
+            var sliders = document.querySelectorAll('[role="slider"]');
+            for (var j = 0; j < sliders.length; j++) {
+              if (sliders[j].getAttribute('aria-valuemin') === '0' && sliders[j].getAttribute('aria-valuemax') === '11') return { ok: true };
+            }
+            await sleep(250);
+          }
+          return { ok: false };
+        })()
+        `,
+        10000,
+        'reopenCanvasPanelForRatio',
+      ).catch(() => ({ ok: false }));
+      ratioResult = await safeExecuteJS<{ ok: boolean; error?: string }>(
+        webview,
+        ratioClickCode,
+        5000,
+        'clickCanvasRatioRetry',
+      ).catch(() => ({ ok: false, error: '比例点击重试异常' }));
+      if (!ratioResult.ok) {
+        return { ok: false, error: ratioResult.error || '画布比例设置失败（重试后仍未找到）' };
+      }
     }
     await sleep(400);
     // 若面板仍未收起（滑杆还在 DOM），发 Escape 关闭；已收起则不再打扰
@@ -5780,7 +5838,7 @@ export async function configureCanvasVideoOptions(
         for (var i = 0; i < buttons.length; i++) {
           var t = (buttons[i].innerText || '').replace(/\\s+/g, ' ').trim();
           if (t.indexOf('模型 ') === 0 && t.indexOf(${JSON.stringify(modelLabel)}) >= 0) modelOk = true;
-          if (/^(自动|\\d+)\\s*·\\s*\\d+s$/.test(t)) { texts.push(t); if (t.indexOf(${JSON.stringify(`${durationSec}s`)}) >= 0) durationOk = true; }
+          if (/^\S+\s*·\s*\d+s$/.test(t)) { texts.push(t); if (t.indexOf(${JSON.stringify(`${durationSec}s`)}) >= 0) durationOk = true; }
         }
         return { modelOk: modelOk, durationOk: durationOk, texts: texts.join('|') };
       })()
@@ -5848,18 +5906,37 @@ export async function openCanvasUploadPicker(webview: WebviewHandle): Promise<Ca
         }
         var container = findComposerContainer();
         if (!container) return { ok: false, error: '未找到画布视频配置条容器' };
-        var plus = null;
-        var cands = container.querySelectorAll('button');
-        for (var j = 0; j < cands.length; j++) {
-          var el = cands[j];
-          if (!visible(el)) continue;
-          var t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-          if (t === '' && !el.getAttribute('aria-label')) { plus = el; break; }
+        // 优先用 data-testid 定位「+」按钮，其次无文本无 aria 的按钮
+        var plus = container.querySelector('button[data-testid="upload_file_button"]');
+        if (!plus) {
+          var cands = container.querySelectorAll('button');
+          for (var j = 0; j < cands.length; j++) {
+            var el = cands[j];
+            if (!visible(el)) continue;
+            var t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+            if (t === '' && !el.getAttribute('aria-label')) { plus = el; break; }
+          }
         }
         if (!plus) return { ok: false, error: '未找到配置条「+」按钮' };
         activate(plus);
+        // 「+」打开下拉菜单（Radix），需继续点击菜单项「上传文件」
+        var uploadItem = null;
+        var menuDeadline = Date.now() + 6000;
+        while (Date.now() < menuDeadline && !uploadItem) {
+          var mis = document.querySelectorAll('[role="menuitem"]');
+          for (var k2 = 0; k2 < mis.length; k2++) {
+            var mi = mis[k2];
+            if (!visible(mi)) continue;
+            var mt = (mi.innerText || '').replace(/\\s+/g, ' ').trim();
+            if (mt === '上传文件') { uploadItem = mi; break; }
+          }
+          if (!uploadItem) await sleep(250);
+        }
+        if (uploadItem) {
+          activate(uploadItem);
+        }
         // 等待 file input 挂载
-        var deadline = Date.now() + 5000;
+        var deadline = Date.now() + 6000;
         while (Date.now() < deadline) {
           var inputs = document.querySelectorAll('input[type="file"]');
           for (var k = 0; k < inputs.length; k++) {
@@ -5867,7 +5944,7 @@ export async function openCanvasUploadPicker(webview: WebviewHandle): Promise<Ca
           }
           await sleep(250);
         }
-        return { ok: false, error: '点击「+」后文件输入框未挂载' };
+        return { ok: false, error: '点击「+/上传文件」后文件输入框未挂载' };
       } catch (e) {
         return { ok: false, error: e.message };
       }
@@ -6010,6 +6087,60 @@ export async function submitCanvasComposer(webview: WebviewHandle): Promise<bool
     console.error('[doubaoBridge] submitCanvasComposer 异常:', err.message);
     return false;
   }
+}
+
+/**
+ * 检测画布提交后出现的「安全确认」素材授权弹窗。
+ * 该弹窗必须由用户人工点击「确认」，生成才会开始；自动化只识别不代点。
+ */
+export async function detectCanvasSafetyConfirm(webview: WebviewHandle): Promise<boolean> {
+  const code = `
+    (function() {
+      function visible(el) {
+        if (!el) return false;
+        var r = el.getBoundingClientRect();
+        var s = window.getComputedStyle(el);
+        return r.width > 100 && r.height > 60 && s.visibility !== 'hidden' && s.display !== 'none';
+      }
+      var els = document.querySelectorAll('*');
+      for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        if (!visible(el)) continue;
+        var t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+        if (t.indexOf('安全确认') === 0 && t.indexOf('取消') >= 0 && t.indexOf('确认') >= 0) return true;
+      }
+      return false;
+    })()
+  `;
+  try {
+    return await safeExecuteJS<boolean>(webview, code, 4000, 'detectCanvasSafetyConfirm');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 等待「安全确认」弹窗消失（用户人工点击确认）。
+ * 有界等待，超时返回 false；自动化不代点，只提示并等待。
+ */
+export async function waitForCanvasSafetyConfirmResolved(
+  webview: WebviewHandle,
+  onWaiting?: () => void,
+  timeoutMs = 180000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  let firstCheck = true;
+  while (Date.now() < deadline) {
+    const present = await detectCanvasSafetyConfirm(webview);
+    if (!present) return true;
+    if (firstCheck) {
+      firstCheck = false;
+      onWaiting?.();
+      console.log('[doubaoBridge] 画布提交触发「安全确认」弹窗，等待用户人工点击确认');
+    }
+    await sleep(2000);
+  }
+  return false;
 }
 
 /** 检测提交后出现的机器人/安全验证界面。 */
