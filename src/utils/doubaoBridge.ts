@@ -5454,10 +5454,12 @@ export async function configureCanvasVideoOptions(
   // 连带隐藏配置条与滑杆，导致回读永远失败。
   if (typeof webview.sendInputEvent === 'function') {
     const sendInputEvent = webview.sendInputEvent.bind(webview) as NonNullable<typeof webview.sendInputEvent>;
+    let lastDiag = '';
     const durationOk = await (async (): Promise<boolean> => {
       const MAX_ATTEMPTS = 3;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
-        const sliderPos = await safeExecuteJS<{ pos?: string }>(
+        // 取滑杆手柄与轨道（手柄的定位父级）信息，用于直接点击目标位置
+        const sliderInfo = await safeExecuteJS<{ pos?: string; track?: string; now?: string }>(
           webview,
           `
           (function() {
@@ -5468,7 +5470,17 @@ export async function configureCanvasVideoOptions(
                 var r = el.getBoundingClientRect();
                 if (r.width <= 0) continue;
                 el.focus();
-                return { pos: Math.round(r.left + r.width / 2) + ',' + Math.round(r.top + r.height / 2) };
+                // 轨道 = 向上找第一个宽度明显大于手柄的祖先
+                var track = el.parentElement;
+                for (var up = 0; track && up < 4; up++) {
+                  if (track.getBoundingClientRect().width >= r.width * 2) break;
+                  track = track.parentElement;
+                }
+                var tr = track ? track.getBoundingClientRect() : r;
+                var out = { pos: Math.round(r.left + r.width / 2) + ',' + Math.round(r.top + r.height / 2),
+                  track: Math.round(tr.left) + ',' + Math.round(tr.right) + ',' + Math.round(tr.top + tr.height / 2),
+                  now: String(el.getAttribute('aria-valuenow') || '') };
+                return out;
               }
             }
             return {};
@@ -5476,18 +5488,59 @@ export async function configureCanvasVideoOptions(
           `,
           3000,
           'findCanvasDurationSlider',
-        ).catch(() => ({}) as { pos?: string });
-        if (sliderPos.pos) {
-          const [sx, sy] = sliderPos.pos.split(',').map(Number);
-          if (Number.isFinite(sx) && Number.isFinite(sy)) {
-            sendInputEvent({ type: 'mouseMove', x: sx, y: sy });
-            sendInputEvent({ type: 'mouseDown', x: sx, y: sy, button: 'left', clickCount: 1 });
-            sendInputEvent({ type: 'mouseUp', x: sx, y: sy, button: 'left', clickCount: 1 });
-            sendInputEvent({ type: 'keyDown', keyCode: 'Home' });
-            sendInputEvent({ type: 'keyUp', keyCode: 'Home' });
-            for (let step = 0; step < durationSec - 4; step += 1) {
-              sendInputEvent({ type: 'keyDown', keyCode: 'Right' });
-              sendInputEvent({ type: 'keyUp', keyCode: 'Right' });
+        ).catch(() => ({}) as { pos?: string; track?: string; now?: string });
+        lastDiag = `valuenow=${sliderInfo.now || '?'}`;
+        if (sliderInfo.pos) {
+          const [sx, sy] = sliderInfo.pos.split(',').map(Number);
+          // 策略 A：直接点击轨道上目标时长对应的位置（15s = 最右端）。
+          // 点击轨道跳变到该值，不依赖键盘焦点。
+          const targetNow = durationSec - 4;
+          if (sliderInfo.track) {
+            const parts = sliderInfo.track.split(',').map(Number);
+            if (parts.length === 3 && parts.every(Number.isFinite)) {
+              const [tLeft, tRight, tY] = parts;
+              const frac = targetNow / 11;
+              const tx = Math.max(tLeft + 2, Math.min(tRight - 2, Math.round(tLeft + (tRight - tLeft) * frac)));
+              sendInputEvent({ type: 'mouseMove', x: tx, y: tY });
+              sendInputEvent({ type: 'mouseDown', x: tx, y: tY, button: 'left', clickCount: 1 });
+              sendInputEvent({ type: 'mouseUp', x: tx, y: tY, button: 'left', clickCount: 1 });
+              await sleep(300);
+            }
+          }
+          // 策略 B：键盘微调到精确值（若焦点可用）
+          const afterClick = await safeExecuteJS<{ now?: string }>(
+            webview,
+            `
+            (function() {
+              var sliders = document.querySelectorAll('[role="slider"]');
+              for (var i = 0; i < sliders.length; i++) {
+                var el = sliders[i];
+                if (el.getAttribute('aria-valuemin') === '0' && el.getAttribute('aria-valuemax') === '11') {
+                  el.focus();
+                  return { now: String(el.getAttribute('aria-valuenow') || '') };
+                }
+              }
+              return {};
+            })()
+            `,
+            3000,
+            'readCanvasSliderNow',
+          ).catch(() => ({}) as { now?: string });
+          lastDiag += `, 点击后 valuenow=${afterClick.now || '?'}`;
+          const nowVal = Number(afterClick.now);
+          if (Number.isFinite(nowVal) && nowVal !== targetNow && nowVal >= 0 && nowVal <= 11) {
+            // 手柄保持焦点，用方向键精确走到目标
+            const steps = targetNow - nowVal;
+            if (steps > 0) {
+              for (let step = 0; step < steps; step += 1) {
+                sendInputEvent({ type: 'keyDown', keyCode: 'Right' });
+                sendInputEvent({ type: 'keyUp', keyCode: 'Right' });
+              }
+            } else {
+              for (let step = 0; step < -steps; step += 1) {
+                sendInputEvent({ type: 'keyDown', keyCode: 'Left' });
+                sendInputEvent({ type: 'keyUp', keyCode: 'Left' });
+              }
             }
           }
         }
@@ -5517,6 +5570,7 @@ export async function configureCanvasVideoOptions(
           4000,
           'checkCanvasDuration',
         ).catch(() => ({ durationOk: false, sliderNow: '', barText: '' }));
+        lastDiag += `, 最终 valuenow=${check.sliderNow}, bar=${check.barText}`;
         if (check.durationOk) return true;
         console.warn(`[doubaoBridge] 画布时长第 ${attempt} 次设置未确认 (valuenow=${check.sliderNow}, bar=${check.barText})，重试`);
         await sleep(400);
@@ -5524,7 +5578,7 @@ export async function configureCanvasVideoOptions(
       return false;
     })();
     if (!durationOk) {
-      return { ok: false, error: `画布时长滑杆设置未回读确认（目标 ${durationSec}s）` };
+      return { ok: false, error: `画布时长滑杆设置未回读确认（目标 ${durationSec}s；${lastDiag}）` };
     }
     // 验证通过后再关面板
     sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
