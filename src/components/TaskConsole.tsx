@@ -35,6 +35,7 @@ import { useTaskStore, isDependencyBlockedTask, describeDependencyBlock } from '
 import { useAccountStore } from '../store/useAccountStore';
 import { useProjectStore } from '../store/useProjectStore';
 import TaskDetailModal from './TaskDetailModal';
+import { DurationSlider, DraggableImageGrid } from './TaskConfigControls';
 import type { Task, TaskUpdateInput } from '../types';
 import {
   TASK_STATUS_CONFIG,
@@ -894,17 +895,11 @@ const TaskConsole: React.FC = () => {
               style={{ background: '#1a1a24', padding: '4px', borderRadius: 8, marginBottom: 12 }}
             />
 
-            {/* 时长选择 */}
-            <div style={{ color: '#9898b8', marginBottom: 8, fontSize: 13 }}>视频时长</div>
-            <Segmented
+            {/* 时长选择（拖动滑杆） */}
+            <div style={{ color: '#9898b8', marginBottom: 8, fontSize: 13 }}>视频时长（拖动选择）</div>
+            <DurationSlider
               value={videoConfig.duration}
-              onChange={(val) => setVideoConfig({ ...videoConfig, duration: val as VideoDuration })}
-              options={Array.from({ length: 12 }, (_, index) => {
-                const seconds = index + 4;
-                return { label: `${seconds} 秒`, value: `${seconds}s` };
-              })}
-              block
-              style={{ background: '#1a1a24', padding: '4px', borderRadius: 8, marginBottom: 12 }}
+              onChange={(val) => setVideoConfig({ ...videoConfig, duration: val })}
             />
 
             {/* 比例选择 */}
@@ -967,80 +962,44 @@ const TaskConsole: React.FC = () => {
         {(selectedMode === 'video' || selectedMode === 'image') && (
           <div style={{ marginBottom: 16 }}>
             <div style={{ color: '#9898b8', marginBottom: 8, fontSize: 13 }}>
-              参考图片（可选，支持多张）
+              参考图片（可选，支持多张，拖动缩略图可调整顺序）
             </div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-              {attachments.map((filePath, idx) => (
-                <div
-                  key={idx}
+            <DraggableImageGrid
+              items={attachments}
+              base64Map={attachmentBase64s}
+              onReorder={(next) => setAttachments(next)}
+              onRemove={(filePath) => {
+                setAttachments((prev) => prev.filter((p) => p !== filePath));
+                setAttachmentBase64s((prev) => {
+                  const next = { ...prev };
+                  delete next[filePath];
+                  return next;
+                });
+              }}
+              addSlot={
+                <button
+                  onClick={handleSelectImages}
                   style={{
-                    position: 'relative',
                     width: 64,
                     height: 64,
                     borderRadius: 6,
-                    border: '1px solid #2a2a3e',
-                    overflow: 'hidden',
-                    background: '#1a1a24',
+                    border: '1px dashed #3a3a5e',
+                    background: 'transparent',
+                    color: '#6b6b88',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: 4,
+                    fontSize: 10,
                   }}
                 >
-                  <img
-                    src={attachmentBase64s[filePath] || ''}
-                    alt={`ref-${idx}`}
-                    style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-                  />
-                  <button
-                    onClick={() => {
-                      setAttachments((prev) => prev.filter((_, i) => i !== idx));
-                      setAttachmentBase64s((prev) => {
-                        const next = { ...prev };
-                        delete next[filePath];
-                        return next;
-                      });
-                    }}
-                    style={{
-                      position: 'absolute',
-                      top: 2,
-                      right: 2,
-                      width: 18,
-                      height: 18,
-                      borderRadius: '50%',
-                      border: 'none',
-                      background: 'rgba(0,0,0,0.6)',
-                      color: '#fff',
-                      fontSize: 10,
-                      cursor: 'pointer',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      lineHeight: 1,
-                    }}
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
-              <button
-                onClick={handleSelectImages}
-                style={{
-                  width: 64,
-                  height: 64,
-                  borderRadius: 6,
-                  border: '1px dashed #3a3a5e',
-                  background: 'transparent',
-                  color: '#6b6b88',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  gap: 4,
-                  fontSize: 10,
-                }}
-              >
-                <PictureOutlined style={{ fontSize: 20 }} />
-                添加
-              </button>
-            </div>
+                  <PictureOutlined style={{ fontSize: 20 }} />
+                  添加
+                </button>
+              }
+            />
           </div>
         )}
 
@@ -1240,16 +1199,10 @@ const TaskConsole: React.FC = () => {
               block
               style={{ background: '#1a1a24', padding: 4, marginBottom: 12 }}
             />
-            <div style={{ color: '#9898b8', marginBottom: 8, fontSize: 13 }}>视频时长</div>
-            <Segmented
+            <div style={{ color: '#9898b8', marginBottom: 8, fontSize: 13 }}>视频时长（拖动选择）</div>
+            <DurationSlider
               value={editingVideoConfig.duration}
-              onChange={(value) => setEditingVideoConfig({ ...editingVideoConfig, duration: value as VideoDuration })}
-              options={Array.from({ length: 12 }, (_, index) => {
-                const seconds = index + 4;
-                return { label: `${seconds} 秒`, value: `${seconds}s` };
-              })}
-              block
-              style={{ background: '#1a1a24', padding: 4, marginBottom: 12 }}
+              onChange={(value) => setEditingVideoConfig({ ...editingVideoConfig, duration: value })}
             />
             <div style={{ color: '#9898b8', marginBottom: 8, fontSize: 13 }}>画面比例</div>
             <Segmented
@@ -1325,33 +1278,22 @@ const TaskConsole: React.FC = () => {
 
         {(editingTask?.mode === 'video' || editingTask?.mode === 'image') && (
           <div style={{ marginBottom: 16 }}>
-            <div style={{ color: '#9898b8', marginBottom: 8, fontSize: 13 }}>参考图片</div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-              {editingAttachments.map((filePath) => (
-                <div key={filePath} style={{ position: 'relative', width: 64, height: 64 }}>
-                  <img
-                    src={editingAttachmentBase64s[filePath] || ''}
-                    alt="参考图片"
-                    style={{ width: 64, height: 64, objectFit: 'cover', borderRadius: 6, border: '1px solid #2a2a3e' }}
-                  />
-                  <Button
-                    size="small"
-                    danger
-                    shape="circle"
-                    icon={<DeleteOutlined />}
-                    onClick={() => setEditingAttachments((current) => current.filter((path) => path !== filePath))}
-                    style={{ position: 'absolute', top: -7, right: -7, width: 22, minWidth: 22, height: 22 }}
-                  />
-                </div>
-              ))}
-              <Button
-                icon={<PictureOutlined />}
-                onClick={handleSelectEditingImages}
-                style={{ width: 64, height: 64 }}
-              >
-                添加
-              </Button>
-            </div>
+            <div style={{ color: '#9898b8', marginBottom: 8, fontSize: 13 }}>参考图片（拖动缩略图可调整顺序）</div>
+            <DraggableImageGrid
+              items={editingAttachments}
+              base64Map={editingAttachmentBase64s}
+              onReorder={(next) => setEditingAttachments(next)}
+              onRemove={(filePath) => setEditingAttachments((current) => current.filter((path) => path !== filePath))}
+              addSlot={
+                <Button
+                  icon={<PictureOutlined />}
+                  onClick={handleSelectEditingImages}
+                  style={{ width: 64, height: 64 }}
+                >
+                  添加
+                </Button>
+              }
+            />
           </div>
         )}
 
