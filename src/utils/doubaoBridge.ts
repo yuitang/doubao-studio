@@ -5111,6 +5111,59 @@ export async function openCanvasVideoComposer(webview: WebviewHandle): Promise<C
         }
         return hasChip && hasModel && hasDuration;
       }
+      // 文本完全相同的子元素会继承父元素的 innerText；
+      // 只接受「叶子」元素，避免点到外层容器导致点击坐标落偏。
+      function isLeafWithText(el, text) {
+        var children = el.children || [];
+        for (var k = 0; k < children.length; k++) {
+          var ct = (children[k].innerText || children[k].textContent || '').replace(/\\s+/g, ' ').trim();
+          if (ct === text) return false;
+        }
+        return true;
+      }
+      function elementText(el) {
+        return ((el.innerText || el.textContent || '') + ' ' +
+          (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || ''))
+          .replace(/\\s+/g, ' ').trim();
+      }
+      function insideMenuContainer(el) {
+        var node = el;
+        for (var depth = 0; node && depth < 8; depth++) {
+          if (node.getAttribute) {
+            var role = node.getAttribute('role') || '';
+            var cls = String(node.className || '');
+            if (role === 'menu' || role === 'listbox' || role === 'dialog' ||
+                /menu|popover|dropdown|overlay|popup|portal/i.test(cls)) return true;
+          }
+          node = node.parentElement;
+        }
+        return false;
+      }
+      // 左侧导航/会话历史里可能有旧画布对话标题（如「新画布」），点开会进旧会话而非画布编辑器，必须排除
+      function insideNavOrHistory(el) {
+        var node = el;
+        for (var depth = 0; node && depth < 10; depth++) {
+          var tagName = (node.tagName || '').toUpperCase();
+          var cls = String(node.className || '');
+          if (tagName === 'NAV' || tagName === 'ASIDE' ||
+              /sidebar|side-bar|conversation|history|nav-/i.test(cls)) return true;
+          node = node.parentElement;
+        }
+        return false;
+      }
+      function collectCanvasDiagnostics() {
+        var found = [];
+        var all = document.querySelectorAll('*');
+        for (var i = 0; i < all.length && found.length < 12; i++) {
+          var el = all[i];
+          if (!visible(el)) continue;
+          var et = elementText(el);
+          if (et.indexOf('画布') !== -1 && et.length < 60) {
+            found.push(el.tagName + (el.getAttribute('aria-label') ? '[aria=' + el.getAttribute('aria-label') + ']' : '') + ':' + et.slice(0, 40));
+          }
+        }
+        return found;
+      }
       async function waitForComposerControls(timeoutMs) {
         var deadline = Date.now() + timeoutMs;
         while (Date.now() < deadline) {
@@ -5132,24 +5185,54 @@ export async function openCanvasVideoComposer(webview: WebviewHandle): Promise<C
             var el = buttons[i];
             if (!visible(el)) continue;
             var t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-            if (t === '技能' && !el.getAttribute('aria-label')) { skillBtn = el; break; }
+            if (t === '技能' && !el.getAttribute('aria-label') && isLeafWithText(el, '技能')) { skillBtn = el; break; }
           }
           if (!skillBtn) return { ok: false, error: '未找到 composer「技能」按钮' };
           activate(skillBtn);
-          // 2. 等技能菜单出现并点击「打开画布/创建画布」
+          // 2. 等技能菜单出现并点击「打开画布/创建画布」。
+          //    匹配优先级：精确「打开画布/创建画布」开头 → 文本含「画布」且在浮层容器内的短文本项。
           var menuItem = null;
-          var menuDeadline = Date.now() + 8000;
+          var menuDeadline = Date.now() + 10000;
+          var scrolled = false;
           while (Date.now() < menuDeadline && !menuItem) {
-            var items = document.querySelectorAll('button, [role="menuitem"], [role="option"], div');
+            var items = document.querySelectorAll('button, [role="menuitem"], [role="option"], div, a');
+            // 优先精确匹配
             for (var j = 0; j < items.length; j++) {
               var it = items[j];
               if (!visible(it)) continue;
               var itText = (it.innerText || '').replace(/\\s+/g, ' ').trim();
-              if (itText.indexOf('打开画布') === 0 || itText.indexOf('创建画布') === 0) { menuItem = it; break; }
+              if ((itText.indexOf('打开画布') === 0 || itText.indexOf('创建画布') === 0) && isLeafWithText(it, itText)) { menuItem = it; break; }
             }
-            if (!menuItem) await sleep(250);
+            // 退路：含「画布」的短文本项——浮层菜单项，或技能市场页的可点卡片（排除侧边栏/历史记录）
+            if (!menuItem) {
+              for (var j2 = 0; j2 < items.length; j2++) {
+                var it2 = items[j2];
+                if (!visible(it2)) continue;
+                var et2 = elementText(it2);
+                if (et2.length > 0 && et2.length <= 24 && et2.indexOf('画布') !== -1 && !insideNavOrHistory(it2)) {
+                  var role2 = (it2.getAttribute('role') || '').toLowerCase();
+                  var clickable = it2.tagName === 'BUTTON' || role2 === 'button' || role2 === 'menuitem' || it2.tagName === 'A' || insideMenuContainer(it2);
+                  if (clickable) { menuItem = it2; break; }
+                }
+              }
+            }
+            if (!menuItem) {
+              await sleep(250);
+              // 4 秒后仍未找到：若技能面板可滚动，滚到底部再扫一次（长列表可能折叠）
+              if (!scrolled && Date.now() > menuDeadline - 6000) {
+                scrolled = true;
+                var panels = document.querySelectorAll('[role="menu"], [role="dialog"], [class*="menu"], [class*="popover"], [class*="dropdown"], [class*="panel"]');
+                for (var p = 0; p < panels.length; p++) {
+                  var pn = panels[p];
+                  if (pn.scrollHeight > pn.clientHeight + 40) pn.scrollTop = pn.scrollHeight;
+                }
+              }
+            }
           }
-          if (!menuItem) return { ok: false, error: '技能菜单中未找到「打开画布/创建画布」' };
+          if (!menuItem) {
+            var diag = collectCanvasDiagnostics();
+            return { ok: false, error: '技能菜单中未找到「打开画布/创建画布」；页面含「画布」元素: ' + (diag.length ? diag.join(' | ') : '无') };
+          }
           activate(menuItem);
           // 3. 等画布编辑器挂载
           var editorDeadline = Date.now() + 15000;
