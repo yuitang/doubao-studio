@@ -5449,50 +5449,137 @@ export async function configureCanvasVideoOptions(
     return { ok: false, error: err.message };
   }
 
-  // 时长滑杆：原生键入（Home 到起点，再按次数右移），与聊天通道同构
+  // 时长滑杆：原生键入（Home 到起点，再按次数右移），与聊天通道同构。
+  // 注意：必须在参数面板仍打开时完成回读验证——Escape 会取消节点选中、
+  // 连带隐藏配置条与滑杆，导致回读永远失败。
   if (typeof webview.sendInputEvent === 'function') {
-    const sliderPos = await safeExecuteJS<{ pos?: string }>(
+    const sendInputEvent = webview.sendInputEvent.bind(webview) as NonNullable<typeof webview.sendInputEvent>;
+    const durationOk = await (async (): Promise<boolean> => {
+      const MAX_ATTEMPTS = 3;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+        const sliderPos = await safeExecuteJS<{ pos?: string }>(
+          webview,
+          `
+          (function() {
+            var sliders = document.querySelectorAll('[role="slider"]');
+            for (var i = 0; i < sliders.length; i++) {
+              var el = sliders[i];
+              if (el.getAttribute('aria-valuemin') === '0' && el.getAttribute('aria-valuemax') === '11') {
+                var r = el.getBoundingClientRect();
+                if (r.width <= 0) continue;
+                el.focus();
+                return { pos: Math.round(r.left + r.width / 2) + ',' + Math.round(r.top + r.height / 2) };
+              }
+            }
+            return {};
+          })()
+          `,
+          3000,
+          'findCanvasDurationSlider',
+        ).catch(() => ({}) as { pos?: string });
+        if (sliderPos.pos) {
+          const [sx, sy] = sliderPos.pos.split(',').map(Number);
+          if (Number.isFinite(sx) && Number.isFinite(sy)) {
+            sendInputEvent({ type: 'mouseMove', x: sx, y: sy });
+            sendInputEvent({ type: 'mouseDown', x: sx, y: sy, button: 'left', clickCount: 1 });
+            sendInputEvent({ type: 'mouseUp', x: sx, y: sy, button: 'left', clickCount: 1 });
+            sendInputEvent({ type: 'keyDown', keyCode: 'Home' });
+            sendInputEvent({ type: 'keyUp', keyCode: 'Home' });
+            for (let step = 0; step < durationSec - 4; step += 1) {
+              sendInputEvent({ type: 'keyDown', keyCode: 'Right' });
+              sendInputEvent({ type: 'keyUp', keyCode: 'Right' });
+            }
+          }
+        }
+        await sleep(500);
+        // 面板仍打开时立即回读：滑杆 aria-valuenow 或配置条按钮文本
+        const check = await safeExecuteJS<{ durationOk: boolean; sliderNow: string; barText: string }>(
+          webview,
+          `
+          (function() {
+            var sliderNow = '';
+            var barText = '';
+            var sliders = document.querySelectorAll('[role="slider"]');
+            for (var j = 0; j < sliders.length; j++) {
+              if (sliders[j].getAttribute('aria-valuemin') === '0' && sliders[j].getAttribute('aria-valuemax') === '11') {
+                sliderNow = String(sliders[j].getAttribute('aria-valuenow') || '');
+              }
+            }
+            var buttons = document.querySelectorAll('button');
+            for (var i = 0; i < buttons.length; i++) {
+              var t = (buttons[i].innerText || '').replace(/\\s+/g, ' ').trim();
+              if (/^(自动|\\d+)\\s*·\\s*\\d+s$/.test(t)) { barText = t; break; }
+            }
+            var durationOk = Number(sliderNow) === ${durationSec - 4} || barText.indexOf('${durationSec}s') >= 0;
+            return { durationOk: durationOk, sliderNow: sliderNow, barText: barText };
+          })()
+          `,
+          4000,
+          'checkCanvasDuration',
+        ).catch(() => ({ durationOk: false, sliderNow: '', barText: '' }));
+        if (check.durationOk) return true;
+        console.warn(`[doubaoBridge] 画布时长第 ${attempt} 次设置未确认 (valuenow=${check.sliderNow}, bar=${check.barText})，重试`);
+        await sleep(400);
+      }
+      return false;
+    })();
+    if (!durationOk) {
+      return { ok: false, error: `画布时长滑杆设置未回读确认（目标 ${durationSec}s）` };
+    }
+    // 验证通过后再关面板
+    sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
+    sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
+  } else {
+    // 无法发送原生键盘事件时，尝试用 JS 键盘事件驱动滑杆
+    await safeExecuteJS<{ ok: boolean }>(
+      webview,
+      `
+      (async function() {
+        function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+        var sliders = document.querySelectorAll('[role="slider"]');
+        var target = null;
+        for (var i = 0; i < sliders.length; i++) {
+          if (sliders[i].getAttribute('aria-valuemin') === '0' && sliders[i].getAttribute('aria-valuemax') === '11') { target = sliders[i]; break; }
+        }
+        if (!target) return { ok: false };
+        target.focus();
+        var opts = { key: 'Home', code: 'Home', keyCode: 36, which: 36, bubbles: true, cancelable: true };
+        target.dispatchEvent(new KeyboardEvent('keydown', opts));
+        await sleep(120);
+        for (var s = 0; s < ${durationSec - 4}; s++) {
+          var ko = { key: 'Right', code: 'Right', keyCode: 39, which: 39, bubbles: true, cancelable: true };
+          target.dispatchEvent(new KeyboardEvent('keydown', ko));
+          await sleep(80);
+        }
+        await sleep(200);
+        return { ok: Number(target.getAttribute('aria-valuenow')) === ${durationSec - 4} };
+      })()
+      `,
+      15000,
+      'setCanvasDurationViaJS',
+    ).catch(() => ({ ok: false }));
+    const fallbackCheck = await safeExecuteJS<{ durationOk: boolean }>(
       webview,
       `
       (function() {
         var sliders = document.querySelectorAll('[role="slider"]');
-        for (var i = 0; i < sliders.length; i++) {
-          var el = sliders[i];
-          if (el.getAttribute('aria-valuemin') === '0' && el.getAttribute('aria-valuemax') === '11') {
-            var r = el.getBoundingClientRect();
-            if (r.width <= 0) continue;
-            el.focus();
-            return { pos: Math.round(r.left + r.width / 2) + ',' + Math.round(r.top + r.height / 2) };
-          }
+        for (var j = 0; j < sliders.length; j++) {
+          if (sliders[j].getAttribute('aria-valuemin') === '0' && sliders[j].getAttribute('aria-valuemax') === '11'
+            && Number(sliders[j].getAttribute('aria-valuenow')) === ${durationSec - 4}) return { durationOk: true };
         }
-        return {};
+        return { durationOk: false };
       })()
       `,
       3000,
-      'findCanvasDurationSlider',
-    ).catch(() => ({}) as { pos?: string });
-    if (sliderPos.pos) {
-      const [sx, sy] = sliderPos.pos.split(',').map(Number);
-      if (Number.isFinite(sx) && Number.isFinite(sy)) {
-        webview.sendInputEvent({ type: 'mouseMove', x: sx, y: sy });
-        webview.sendInputEvent({ type: 'mouseDown', x: sx, y: sy, button: 'left', clickCount: 1 });
-        webview.sendInputEvent({ type: 'mouseUp', x: sx, y: sy, button: 'left', clickCount: 1 });
-        webview.sendInputEvent({ type: 'keyDown', keyCode: 'Home' });
-        webview.sendInputEvent({ type: 'keyUp', keyCode: 'Home' });
-        for (let step = 0; step < durationSec - 4; step += 1) {
-          webview.sendInputEvent({ type: 'keyDown', keyCode: 'Right' });
-          webview.sendInputEvent({ type: 'keyUp', keyCode: 'Right' });
-        }
-      }
+      'checkCanvasDurationFallback',
+    ).catch(() => ({ durationOk: false }));
+    if (!fallbackCheck.durationOk) {
+      return { ok: false, error: `画布时长滑杆设置未回读确认（目标 ${durationSec}s）` };
     }
-    await sleep(400);
-    // 关闭参数面板
-    webview.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
-    webview.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
   }
   await sleep(300);
 
-  // 回读验证
+  // 最终回读（面板已关）：确认配置条上的模型与时长文本
   try {
     const verify = await safeExecuteJS<{ modelOk: boolean; durationOk: boolean; texts: string }>(
       webview,
@@ -5506,11 +5593,6 @@ export async function configureCanvasVideoOptions(
           if (t.indexOf('模型 ') === 0 && t.indexOf(${JSON.stringify(modelLabel)}) >= 0) modelOk = true;
           if (/^(自动|\\d+)\\s*·\\s*\\d+s$/.test(t)) { texts.push(t); if (t.indexOf(${JSON.stringify(`${durationSec}s`)}) >= 0) durationOk = true; }
         }
-        var sliders = document.querySelectorAll('[role="slider"]');
-        for (var j = 0; j < sliders.length; j++) {
-          if (sliders[j].getAttribute('aria-valuemin') === '0' && sliders[j].getAttribute('aria-valuemax') === '11'
-            && Number(sliders[j].getAttribute('aria-valuenow')) === ${durationSec - 4}) durationOk = true;
-        }
         return { modelOk: modelOk, durationOk: durationOk, texts: texts.join('|') };
       })()
       `,
@@ -5518,7 +5600,12 @@ export async function configureCanvasVideoOptions(
       'verifyCanvasVideoOptions',
     );
     if (!verify.modelOk || !verify.durationOk) {
-      return { ok: false, error: `画布参数回读不一致: model=${verify.modelOk}, duration=${verify.durationOk} (${verify.texts})` };
+      // 面板关闭后配置条文本可能因节点取消选中而缺失；不视为失败——
+      // 时长已在面板打开阶段严格回读确认过，这里只校验模型。
+      if (!verify.modelOk) {
+        return { ok: false, error: `画布参数回读不一致: model=${verify.modelOk}, duration=${verify.durationOk} (${verify.texts})` };
+      }
+      console.warn('[doubaoBridge] 画布配置条时长文本回读缺失（面板已关，此前已确认），忽略');
     }
     return { ok: true };
   } catch (err: any) {
