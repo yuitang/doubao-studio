@@ -70,10 +70,19 @@ describe('账号自动化可用性检测', () => {
     expect(script).toContain('childHasSameText');
   });
 
-  it('豆包输入框先于账号壳渲染时保持 unknown，不会误判 ready', () => {
+  it('新版豆包 UI 无文字导航时，输入区 + 无登录入口证据判定 ready', () => {
     const result = classifyAccountAvailability({
       platform: 'doubao', url: 'https://www.doubao.com/chat/', hasUsableEditor: true,
       hasLoginControl: false, hasAuthenticatedControl: false, documentReady: true,
+    }, 'startup', CHECKED_AT);
+    expect(result).toMatchObject({ state: 'ready', reason: 'ready' });
+  });
+
+  it('输入区存在但页面仍有登录文案时保持 unknown，不会误判 ready', () => {
+    const result = classifyAccountAvailability({
+      platform: 'doubao', url: 'https://www.doubao.com/chat/', hasUsableEditor: true,
+      hasLoginControl: false, hasAuthenticatedControl: false, documentReady: true,
+      bodyText: '请先登录后使用完整功能',
     }, 'startup', CHECKED_AT);
     expect(result).toMatchObject({ state: 'unknown', reason: 'authentication_unconfirmed' });
   });

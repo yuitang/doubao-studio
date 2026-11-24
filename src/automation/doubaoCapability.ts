@@ -78,7 +78,9 @@ export function evaluateDryRunSelection(
   snapshot: DoubaoCapabilitySnapshot,
   requested: { model: string; duration: number; aspectRatio: string },
 ): { ok: boolean; code: 'ready' | 'membership_required' | 'ui_unsupported'; finalSubmit: false } {
-  if (requested.duration >= 11 && snapshot.membership.availability !== 'selectable') {
+  // 2026-11 起豆包免费账号可生成 11–15 秒视频；仅当页面出现明确会员
+  // 动作证据（action_required）时阻断，unknown 不再视为会员限制。
+  if (requested.duration >= 11 && snapshot.membership.availability === 'action_required') {
     return { ok: false, code: 'membership_required', finalSubmit: false };
   }
   const known = snapshot.video.models.includes(requested.model)

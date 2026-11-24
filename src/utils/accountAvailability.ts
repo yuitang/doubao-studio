@@ -130,9 +130,14 @@ export function classifyAccountAvailability(
 
   if (evidence.hasUsableEditor) {
     // 豆包匿名页也提供输入框，“登录”按钮却可能在 SPA 启动后数秒才出现。
-    // Doubao 必须同时看到已登录导航证据，否则保持 unknown 等待稳定化复检。
+    // 新版豆包登录态 UI 只显示右上角头像图标，"定时任务/云盘"等文字导航已
+    // 不再出现。因此：有登录入口证据（登录按钮/登录 URL/登录文案）时保持
+    // unknown 等待稳定化复检；完全无登录入口证据时视为已登录。
     if (evidence.platform === 'doubao' && !evidence.hasAuthenticatedControl) {
-      return result('unknown', 'authentication_unconfirmed', '已看到输入区，但尚未确认登录身份，正在自动复检', checkedAt, source);
+      if (includesAny(allText, LOGIN_PHRASES)) {
+        return result('unknown', 'authentication_unconfirmed', '已看到输入区，但尚未确认登录身份，正在自动复检', checkedAt, source);
+      }
+      return result('ready', 'ready', '账号页面正常，可执行自动化', checkedAt, source);
     }
     return result('ready', 'ready', '账号页面正常，可执行自动化', checkedAt, source);
   }
@@ -172,20 +177,35 @@ const PAGE_EVIDENCE_SCRIPT = `
     var hasLoginControl = false;
     var hasAuthenticatedControl = false;
     // 新版匿名页把“登录”渲染成普通 div/span，而非 button。必须扫描精确
-    // 叶子文本；已登录证据仍只接受受限的导航动作，不能用任意页面文字猜测。
-    var controls = document.querySelectorAll('button, a, [role="button"], div, span');
+    // 叶子文本；新版登录态 UI 只显示头像图标（无文字导航），因此同时检测
+    // 头像元素与 aria-label/title/alt 属性中的登录入口。
+    var controls = document.querySelectorAll('button, a, [role="button"], div, span, img');
     for (var c = 0; c < controls.length && c < 800; c++) {
-      if (!visible(controls[c])) continue;
-      var controlText = String(controls[c].innerText || controls[c].textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-      var childHasSameText = Array.from(controls[c].children || []).some(function (child) {
+      var el = controls[c];
+      if (!visible(el)) continue;
+      var controlText = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+      if (el.tagName === 'IMG') controlText = '';
+      var attrText = [
+        el.getAttribute && el.getAttribute('aria-label'),
+        el.getAttribute && el.getAttribute('title'),
+        el.tagName === 'IMG' ? el.getAttribute('alt') : null,
+      ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim().toLowerCase();
+      var childHasSameText = Array.from(el.children || []).some(function (child) {
         return String(child.innerText || child.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase() === controlText;
       });
-      if (!childHasSameText && (controlText === '登录' || controlText === '立即登录' || controlText === 'log in' || controlText === 'sign in')) {
+      if (!childHasSameText && (controlText === '登录' || controlText === '立即登录' || controlText === 'log in' || controlText === 'sign in'
+        || attrText === '登录' || attrText === '立即登录' || attrText === '点击登录' || attrText === 'log in' || attrText === 'sign in')) {
         hasLoginControl = true;
       }
-      if (controlText === '定时任务' || controlText === '云盘' || controlText === '退出登录' || controlText === 'log out' || controlText === 'sign out') {
+      if (controlText === '定时任务' || controlText === '云盘' || controlText === '退出登录' || controlText === '退出账号' || controlText === 'log out' || controlText === 'sign out') {
         hasAuthenticatedControl = true;
       }
+    }
+    // 新版豆包登录态仅展示头像（右上角圆形头像），没有可见文字导航。
+    // 任何可见的头像元素即视为已登录证据。
+    var avatars = document.querySelectorAll('[class*="avatar" i], img[src*="avatar"]');
+    for (var a = 0; a < avatars.length && a < 30; a++) {
+      if (visible(avatars[a])) { hasAuthenticatedControl = true; break; }
     }
     return {
       bodyText: String(document.body ? document.body.innerText || '' : '').slice(0, 6000),

@@ -4,7 +4,7 @@
  *
  * 职责：
  * 1. 在提交视频任务前，基于本地已知状态判断是否允许提交
- * 2. 对 11–15 秒配置要求页面实时能力证据，无法确认时 fail-closed
+ * 2. 对 11–15 秒配置，仅在页面出现明确会员限制证据时阻断（2026-11 起免费账号可生成 15 秒）
  * 3. 提供建议配置，但绝不自动替换用户配置
  *
  * 合规约束：
@@ -55,7 +55,7 @@ export interface VideoCapabilityInput {
   aspectRatio: VideoAspectRatio;
   /** 是否启用手动 15 秒补丁 */
   manual15sEnabled: boolean;
-  /** 页面实时观察结果；只有 selectable 能授权 11–15 秒继续配置。 */
+  /** 页面实时观察结果；出现 membership_required 时阻断 11–15 秒提交，unknown 放行 */
   platformAvailability?: 'selectable' | 'membership_required' | 'unknown';
   /** 账号本地额度状态（来自 Account.seedanceQuota） */
   seedanceQuota?: Account['seedanceQuota'];
@@ -102,10 +102,11 @@ export interface VideoCapabilityResult {
  * 4. 调度暂停 → blocked
  * 5. 冷却中 → blocked
  * 6. 额度耗尽 → blocked
- * 7. 11–15 秒缺少页面可选证据或出现会员窗口 → blocked
+ * 7. 11–15 秒出现页面会员窗口证据 → blocked（unknown 不再阻断）
  * 8. 其他情况 → allowed
  *
- * 会员资格不能仅凭本地推断为"可用"。未能确认时必须 fail-closed。
+ * 2026-11 更新：豆包已向免费账号开放 11–15 秒视频生成，本地不再要求
+ * "页面实时可选证据"才能提交；只有页面明确弹出会员限制时才 fail-closed。
  */
 export function evaluateVideoCapability(input: VideoCapabilityInput): VideoCapabilityResult {
   const now = input.now ?? Date.now();
@@ -182,15 +183,16 @@ export function evaluateVideoCapability(input: VideoCapabilityInput): VideoCapab
     });
   }
 
-  // ---- 7. 11–15 秒实时能力门禁 ----
+  // ---- 7. 11–15 秒会员窗口门禁 ----
+  // 2026-11 起豆包免费账号也可生成 11–15 秒视频，不再要求页面实时可选证据。
+  // 仅当页面出现明确的会员限制证据时才阻断，unknown 保持放行。
   const durationSeconds = Number.parseInt(input.duration, 10);
-  const requiresLiveEntitlement = durationSeconds >= 11;
-  if (requiresLiveEntitlement && input.platformAvailability !== 'selectable') {
+  const isLongDuration = durationSeconds >= 11;
+  const membershipBlocked = isLongDuration && input.platformAvailability === 'membership_required';
+  if (membershipBlocked) {
     issues.push({
       code: 'membership_required',
-      message: input.platformAvailability === 'membership_required'
-        ? '当前页面要求会员操作，已停止提交'
-        : '11–15 秒可能需要会员权益，缺少当前页面实时可选证据时禁止提交',
+      message: '当前页面要求会员操作，已停止提交',
       blocking: true,
     });
   }
@@ -207,12 +209,12 @@ export function evaluateVideoCapability(input: VideoCapabilityInput): VideoCapab
       issues,
       userMessage,
       canSubmit: false,
-      // 提供建议配置（仅作为建议）
-      suggestion: requiresLiveEntitlement
+      // 提供建议配置（仅作为建议）：仅在会员窗口导致阻断时建议降回 10 秒
+      suggestion: membershipBlocked
         ? {
             model: input.model,
             duration: '10s',
-            reason: '当前账户观察到 10 秒兼容性更好；仍应以页面实时能力为准',
+            reason: '当前页面出现会员限制；10 秒兼容性更好，是否调整由用户决定',
           }
         : undefined,
     };
@@ -235,14 +237,7 @@ export function suggestCompatibleVideoConfig(
   model: VideoModel,
   duration: VideoDuration,
 ): SuggestedVideoConfig | undefined {
-  if (Number.parseInt(duration, 10) >= 11) {
-    return {
-      model,
-      duration: '10s',
-      reason: '11–15 秒需要页面实时能力证据；当前账户观察到 10 秒兼容性更好',
-    };
-  }
-
+  // 2026-11 起免费账号可生成 11–15 秒，不再默认建议降回 10 秒。
   return undefined;
 }
 

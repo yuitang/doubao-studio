@@ -162,7 +162,7 @@ describe('evaluateVideoCapability', () => {
   });
 
   describe('11–15s 页面实时能力门禁', () => {
-    it('15s + seedance-2.0-fast 缺少实时证据时 fail-closed', () => {
+    it('15s + seedance-2.0-fast 缺少实时证据时不再阻断（免费账号已开放 15 秒）', () => {
       const input = makeBaseInput({
         model: 'seedance-2.0-fast',
         duration: '15s',
@@ -172,30 +172,11 @@ describe('evaluateVideoCapability', () => {
         accountStatus: healthyAccountStatus,
       });
       const result = evaluateVideoCapability(input);
-      expect(result.state).toBe('blocked');
-      expect(result.canSubmit).toBe(false);
-      expect(result.issues.some(i => i.code === 'membership_required' && i.blocking)).toBe(true);
+      expect(result.state).toBe('allowed');
+      expect(result.canSubmit).toBe(true);
     });
 
-    it('15s + seedance-2.0-fast 提供建议配置但不改变原始配置', () => {
-      const input = makeBaseInput({
-        model: 'seedance-2.0-fast',
-        duration: '15s',
-        seedanceQuota: healthySeedanceQuota,
-        health: healthyHealth,
-        scheduling: healthyScheduling,
-        accountStatus: healthyAccountStatus,
-      });
-      const result = evaluateVideoCapability(input);
-      expect(result.suggestion).toBeDefined();
-      expect(result.suggestion!.model).toBe('seedance-2.0-fast');
-      expect(result.suggestion!.duration).toBe('10s');
-      // 原始输入不被修改
-      expect(input.model).toBe('seedance-2.0-fast');
-      expect(input.duration).toBe('15s');
-    });
-
-    it('页面明确出现会员动作时返回 blocked', () => {
+    it('页面明确出现会员动作时返回 blocked 并建议降回 10 秒', () => {
       const input = makeBaseInput({
         model: 'seedance-2.0',
         duration: '15s',
@@ -208,9 +189,18 @@ describe('evaluateVideoCapability', () => {
       const result = evaluateVideoCapability(input);
       expect(result.state).toBe('blocked');
       expect(result.canSubmit).toBe(false);
+      expect(result.issues.some(i => i.code === 'membership_required' && i.blocking)).toBe(true);
+      expect(result.suggestion).toBeDefined();
+      expect(result.suggestion!.duration).toBe('10s');
     });
 
-    it('只有页面实时确认 selectable 时允许 11s', () => {
+    it('11s 无页面证据时允许提交', () => {
+      const result = evaluateVideoCapability(makeBaseInput({ duration: '11s' }));
+      expect(result.state).toBe('allowed');
+      expect(result.canSubmit).toBe(true);
+    });
+
+    it('11s 页面实时确认 selectable 时允许提交', () => {
       const result = evaluateVideoCapability(makeBaseInput({ duration: '11s', platformAvailability: 'selectable' }));
       expect(result.state).toBe('allowed');
       expect(result.canSubmit).toBe(true);
@@ -298,44 +288,16 @@ describe('evaluateVideoCapability', () => {
 
   // ---- 测试 7: 建议配置仅作为建议，不改变原始 videoConfig ----
   describe('suggestCompatibleVideoConfig', () => {
-    it('15s + seedance-2.0-fast 返回建议配置', () => {
-      const suggestion = suggestCompatibleVideoConfig('seedance-2.0-fast', '15s');
-      expect(suggestion).toBeDefined();
-      expect(suggestion!.model).toBe('seedance-2.0-fast');
-      expect(suggestion!.duration).toBe('10s');
-      expect(suggestion!.reason).toContain('实时能力证据');
-    });
-
-    it('15s + 其他模型返回建议配置', () => {
-      const suggestion = suggestCompatibleVideoConfig('seedance-2.0', '15s');
-      expect(suggestion).toBeDefined();
-      expect(suggestion!.duration).toBe('10s');
-      expect(suggestion!.reason).toContain('实时能力证据');
-    });
-
-    it('非 15s 配置不返回建议', () => {
-      const suggestion = suggestCompatibleVideoConfig('seedance-2.0', '10s');
-      expect(suggestion).toBeUndefined();
-    });
-
-    it('5s 配置不返回建议', () => {
-      const suggestion = suggestCompatibleVideoConfig('seedance-2.0', '5s');
-      expect(suggestion).toBeUndefined();
-    });
-
-    it('建议配置不修改原始输入值', () => {
-      const model = 'seedance-2.0-fast';
-      const duration = '15s';
-      const suggestion = suggestCompatibleVideoConfig(model, duration);
-      expect(suggestion).toBeDefined();
-      // 原始值不变
-      expect(model).toBe('seedance-2.0-fast');
-      expect(duration).toBe('15s');
+    it('免费账号已开放 11–15 秒，不再默认建议降回 10 秒', () => {
+      expect(suggestCompatibleVideoConfig('seedance-2.0-fast', '15s')).toBeUndefined();
+      expect(suggestCompatibleVideoConfig('seedance-2.0', '15s')).toBeUndefined();
+      expect(suggestCompatibleVideoConfig('seedance-2.0', '10s')).toBeUndefined();
+      expect(suggestCompatibleVideoConfig('seedance-2.0', '5s')).toBeUndefined();
     });
   });
 
-  describe('旧补丁标记不能绕过会员门禁', () => {
-    it('manual15sEnabled = true 时 15s 仍 blocked', () => {
+  describe('旧补丁标记与会员门禁解耦', () => {
+    it('manual15sEnabled = true 时 15s 不再因会员门禁 blocked', () => {
       const input = makeBaseInput({
         model: 'seedance-2.0-fast',
         duration: '15s',
@@ -346,11 +308,11 @@ describe('evaluateVideoCapability', () => {
         accountStatus: healthyAccountStatus,
       });
       const result = evaluateVideoCapability(input);
-      expect(result.state).toBe('blocked');
-      expect(result.canSubmit).toBe(false);
+      expect(result.state).toBe('allowed');
+      expect(result.canSubmit).toBe(true);
     });
 
-    it('manual15sEnabled = false 时 15s 也 blocked', () => {
+    it('manual15sEnabled = false 时 15s 同样允许', () => {
       const input = makeBaseInput({
         model: 'seedance-2.0-fast',
         duration: '15s',
@@ -361,8 +323,8 @@ describe('evaluateVideoCapability', () => {
         accountStatus: healthyAccountStatus,
       });
       const result = evaluateVideoCapability(input);
-      expect(result.state).toBe('blocked');
-      expect(result.canSubmit).toBe(false);
+      expect(result.state).toBe('allowed');
+      expect(result.canSubmit).toBe(true);
     });
 
     it('manual15sEnabled = true 时额度耗尽仍返回 blocked', () => {
@@ -517,9 +479,10 @@ describe('豆包新 UI 只读能力快照与 dry-run', () => {
   });
 
   it.each([
-    ['unknown', false, 'membership_required'],
+    ['unknown', true, 'ready'],
     ['selectable', true, 'ready'],
-  ] as const)('11 秒 availability=%s 时按实时证据门禁', (availability, ok, code) => {
+    ['action_required', false, 'membership_required'],
+  ] as const)('11 秒 availability=%s 时按页面会员证据门禁', (availability, ok, code) => {
     const snapshot = buildDoubaoCapabilitySnapshot({ pageUrl: 'https://www.doubao.com/', bodyText: pageText });
     snapshot.membership.availability = availability;
     expect(evaluateDryRunSelection(snapshot, { model: 'Seedance 2.5', duration: 11, aspectRatio: '16:9' }))
