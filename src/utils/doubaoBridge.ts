@@ -986,7 +986,7 @@ export async function findSendButtonTarget(webview: WebviewHandle): Promise<Send
             var nearVertical = rect.top <= editorRect.bottom + 80 && rect.bottom >= editorRect.top - 40;
             var square = rect.width >= 24 && rect.width <= 64 && rect.height >= 24 && rect.height <= 64;
             var semantic = /发送|提交|生成|send|submit|generate/.test(descriptor);
-            var rgb = (window.getComputedStyle(control).backgroundColor || '').match(/\d+/g);
+            var rgb = (window.getComputedStyle(control).backgroundColor || '').match(/\\d+/g);
             var accent = !!(rgb && rgb.length >= 3 && Number(rgb[2]) > Number(rgb[0]) && Number(rgb[2]) > Number(rgb[1]) && Number(rgb[2]) > 120);
             if (nearRight && nearVertical && square && (semantic || accent)) {
               matches.push({ el: control, semantic: semantic, accent: accent });
@@ -4379,7 +4379,7 @@ async function configureVideoOptionsV2(
 export async function uploadReferenceImages(
   webview: WebviewHandle,
   fileDataList: Array<{ name: string; base64: string; mime: string }>,
-  options: { timeoutMs?: number; stableSamples?: number; onProgress?: (diagnostic: UploadReadinessDiagnostic) => void | Promise<void> } = {},
+  options: { timeoutMs?: number; stableSamples?: number; skipInject?: boolean; onProgress?: (diagnostic: UploadReadinessDiagnostic) => void | Promise<void> } = {},
 ): Promise<boolean> {
   if (!fileDataList || fileDataList.length === 0) return true;
 
@@ -4432,10 +4432,18 @@ export async function uploadReferenceImages(
         if (inputs.length === 0) {
           return { ok: false, error: '未找到 file input 元素' };
         }
-        
-        var inp = inputs[0];
+
+        // 页面里可能同时存在聊天通道预置的隐藏 file input 与画布「上传文件」菜单
+        // 新挂载的 input；必须注入到可见的那个，否则 change 事件对画布无效。
+        var inp = null;
+        for (var k = 0; k < inputs.length; k++) {
+          var r = inputs[k].getBoundingClientRect();
+          if (r.width > 2 && r.height > 2) { inp = inputs[k]; break; }
+        }
+        if (!inp) inp = inputs[0];
+
         var dataTransfer = new DataTransfer();
-        
+
         for (var i = 0; i < fileDataList.length; i++) {
           var fd = fileDataList[i];
           // base64 解码为 ArrayBuffer
@@ -4447,29 +4455,34 @@ export async function uploadReferenceImages(
           var file = new File([bytes], fd.name, { type: fd.mime });
           dataTransfer.items.add(file);
         }
-        
+
         inp.files = dataTransfer.files;
         inp.dispatchEvent(new Event('change', { bubbles: true }));
-        
-        return { ok: true, count: fileDataList.length };
+
+        return { ok: true, count: fileDataList.length, visibleInput: inp !== inputs[0] || inputs.length === 1 };
       } catch (e) {
         return { ok: false, error: e.message };
       }
     })()
   `;
 
-  const result = await safeExecuteJS<{ ok: boolean; count?: number; error?: string }>(
-    webview,
-    injectCode,
-    5000,
-    'injectFiles'
-  );
-
-  if (result?.ok) {
-    console.log(`[doubaoBridge] 文件注入成功: ${result.count} 张，等待上传完成...`);
+  if (options.skipInject) {
+    // CDP 已通过 DOM.setFileInputFiles 原生设置文件（浏览器会自动派发 change），跳过合成注入。
+    console.log(`[doubaoBridge] CDP 原生注入模式，直接等待上传完成: ${fileDataList.length} 张`);
   } else {
-    console.warn('[doubaoBridge] 文件注入失败:', result?.error);
-    return false;
+    const result = await safeExecuteJS<{ ok: boolean; count?: number; error?: string }>(
+      webview,
+      injectCode,
+      5000,
+      'injectFiles'
+    );
+
+    if (result?.ok) {
+      console.log(`[doubaoBridge] 文件注入成功: ${result.count} 张，等待上传完成...`);
+    } else {
+      console.warn('[doubaoBridge] 文件注入失败:', result?.error);
+      return false;
+    }
   }
 
   const startedAt = Date.now();
@@ -5071,6 +5084,173 @@ export async function probeStandardVideoEntry(
   }
 }
 
+/** 画布视频节点定位：返回节点中心坐标（节点可能大于视口，位置随画布视图变化）。 */
+const CANVAS_VIDEO_NODE_LOCATOR = `
+  (function() {
+    var best = null, bestArea = Infinity;
+    var cands = document.querySelectorAll('[aria-label]');
+    for (var i = 0; i < cands.length; i++) {
+      var a = cands[i].getAttribute('aria-label') || '';
+      if (!/生成视频|视频生成|视频节点/.test(a)) continue;
+      var r = cands[i].getBoundingClientRect();
+      if (r.width < 80 || r.height < 80) continue;
+      var area = r.width * r.height;
+      if (area < bestArea) { bestArea = area; best = cands[i]; }
+    }
+    if (!best) return { found: false };
+    var r2 = best.getBoundingClientRect();
+    return { found: true, x: Math.round(r2.left + r2.width / 2), y: Math.round(r2.top + r2.height / 2) };
+  })()
+`;
+
+/** 画布配置条就绪检测（视频生成芯片 + 模型 + 比例/时长）。 */
+const CANVAS_COMPOSER_CONTROLS_READY = `
+  (function() {
+    var els = document.querySelectorAll('button, [role="button"], div, span');
+    var hasChip = false, hasModel = false, hasDuration = false;
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      var r = el.getBoundingClientRect();
+      if (r.width <= 2 || r.height <= 2) continue;
+      if (el.tagName !== 'BUTTON' && el.children.length > 2) continue;
+      var t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+      if (!el.getAttribute('aria-label') && t === '视频生成') hasChip = true;
+      if (t.indexOf('模型') === 0 && t.indexOf('Seedance') >= 0) hasModel = true;
+      if (/^\\S+\\s*·\\s*\\d+s$/.test(t)) hasDuration = true;
+    }
+    return { ready: hasChip && hasModel && hasDuration };
+  })()
+`;
+
+/**
+ * 画布「显示全部元素」：把全部节点适配进视口。
+ * 节点配置条跟随节点在画布上的位置浮动，节点被平移出视口时原生点击无法命中，
+ * 必须先经缩放菜单（缩放，当前 X% → 显示全部元素）把视图适配回来。
+ */
+async function canvasFitToView(
+  webview: WebviewHandle,
+  sendInputEvent: NonNullable<typeof webview.sendInputEvent> | null,
+): Promise<boolean> {
+  if (!sendInputEvent) return false;
+  const click = (x: number, y: number) => {
+    sendInputEvent({ type: 'mouseMove', x, y });
+    sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+    sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+  };
+  const zoomBtn = await safeExecuteJS<{ found: boolean; x?: number; y?: number }>(
+    webview,
+    `
+    (function() {
+      var els = document.querySelectorAll('[aria-label]');
+      for (var i = 0; i < els.length; i++) {
+        var a = els[i].getAttribute('aria-label') || '';
+        if (/^缩放，当前/.test(a)) {
+          var r = els[i].getBoundingClientRect();
+          if (r.width <= 0) continue;
+          if (r.right > window.innerWidth || r.bottom > window.innerHeight || r.top < 0 || r.left < 0) continue;
+          return { found: true, x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        }
+      }
+      return { found: false };
+    })()
+    `,
+    3000,
+    'locateCanvasZoomButton',
+  ).catch(() => ({ found: false }) as { found: boolean; x?: number; y?: number });
+  if (!zoomBtn.found || typeof zoomBtn.x !== 'number' || typeof zoomBtn.y !== 'number') {
+    // 视图可能仍在入场动画中（按钮短暂出视口）：等待稳定后重试，最多 3 次
+    for (let retry = 0; retry < 3; retry += 1) {
+      await sleep(1200);
+      const retryZoom = await safeExecuteJS<{ found: boolean; x?: number; y?: number }>(
+        webview,
+        `
+        (function() {
+          var els = document.querySelectorAll('[aria-label]');
+          for (var i = 0; i < els.length; i++) {
+            var a = els[i].getAttribute('aria-label') || '';
+            if (/^缩放，当前/.test(a)) {
+              var r = els[i].getBoundingClientRect();
+              if (r.width <= 0 || r.right > window.innerWidth || r.top > window.innerHeight || r.top < 0) continue;
+              return { found: true, x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+            }
+          }
+          return { found: false };
+        })()
+        `,
+        3000,
+        'locateCanvasZoomButtonRetry',
+      ).catch(() => ({ found: false }) as { found: boolean; x?: number; y?: number });
+      if (retryZoom.found && typeof retryZoom.x === 'number' && typeof retryZoom.y === 'number') {
+        zoomBtn.x = retryZoom.x;
+        zoomBtn.y = retryZoom.y;
+        break;
+      }
+    }
+    if (typeof zoomBtn.x !== 'number') return false;
+  }
+  // 菜单可能已经打开（上次点击残留）：先探测「显示全部元素」是否可见
+  const findFitItem = `
+    (function() {
+      var els = document.querySelectorAll('div, span, button, [role="menuitem"]');
+      var best = null, bestArea = Infinity;
+      for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        var r = el.getBoundingClientRect();
+        if (r.width <= 2 || r.height <= 2) continue;
+        var t = (el.innerText || '').trim();
+        if (t !== '显示全部元素') continue;
+        var area = r.width * r.height;
+        if (area < bestArea) { bestArea = area; best = el; }
+      }
+      if (!best) return { found: false };
+      var r2 = best.getBoundingClientRect();
+      return { found: true, x: Math.round(r2.left + r2.width / 2), y: Math.round(r2.top + r2.height / 2) };
+    })()
+  `;
+  const preOpen = await safeExecuteJS<{ found: boolean; x?: number; y?: number }>(
+    webview, findFitItem, 2000, 'locateCanvasFitMenuPreOpen',
+  ).catch(() => ({ found: false }) as { found: boolean; x?: number; y?: number });
+  if (preOpen.found && typeof preOpen.x === 'number' && typeof preOpen.y === 'number') {
+    click(preOpen.x, preOpen.y);
+    await sleep(800);
+    return true;
+  }
+  if (typeof zoomBtn.x !== 'number' || typeof zoomBtn.y !== 'number') return false;
+  click(zoomBtn.x, zoomBtn.y);
+  for (let p = 0; p < 12; p += 1) {
+    const fit = await safeExecuteJS<{ found: boolean; x?: number; y?: number }>(
+      webview,
+      `
+      (function() {
+        var els = document.querySelectorAll('div, span, button, [role="menuitem"]');
+        var best = null, bestArea = Infinity;
+        for (var i = 0; i < els.length; i++) {
+          var el = els[i];
+          var r = el.getBoundingClientRect();
+          if (r.width <= 2 || r.height <= 2) continue;
+          var t = (el.innerText || '').trim();
+          if (t !== '显示全部元素') continue;
+          var area = r.width * r.height;
+          if (area < bestArea) { bestArea = area; best = el; }
+        }
+        if (!best) return { found: false };
+        var r2 = best.getBoundingClientRect();
+        return { found: true, x: Math.round(r2.left + r2.width / 2), y: Math.round(r2.top + r2.height / 2) };
+      })()
+      `,
+      3000,
+      'locateCanvasFitButton',
+    ).catch(() => ({ found: false }) as { found: boolean; x?: number; y?: number });
+    if (fit.found && typeof fit.x === 'number' && typeof fit.y === 'number') {
+      click(fit.x, fit.y);
+      await sleep(800);
+      return true;
+    }
+    await sleep(250);
+  }
+  return false;
+}
+
 /**
  * 打开画布视频节点编辑器：
  * 确保画布面板打开（composer 技能 → 打开画布/创建画布），
@@ -5107,7 +5287,7 @@ export async function openCanvasVideoComposer(webview: WebviewHandle): Promise<C
           var t = (buttons[i].innerText || '').replace(/\\s+/g, ' ').trim();
           if (!buttons[i].getAttribute('aria-label') && t === '视频生成') hasChip = true;
           if (t.indexOf('模型 Seedance') === 0 || t.indexOf('模型 ') === 0) hasModel = true;
-          if (/^\S+\s*·\s*\d+s$/.test(t)) hasDuration = true;
+          if (/^\\S+\\s*·\\s*\\d+s$/.test(t)) hasDuration = true;
         }
         return hasChip && hasModel && hasDuration;
       }
@@ -5182,17 +5362,22 @@ export async function openCanvasVideoComposer(webview: WebviewHandle): Promise<C
           // 「技能」按钮结构可能是 <button><icon/><span>技能</span></button>：
           // 文本在叶子 span 里而按钮本身不是叶子。收集所有文本命中元素，
           // 选包围盒最小（最深层）的那个点击，避免点到外层容器导致坐标落偏。
+          // 注意：新开页面时 composer 工具栏可能晚于其他控件渲染，必须有界等待而非单次探测。
           var skillBtn = null;
           var skillArea = Infinity;
-          var buttons = document.querySelectorAll('button, [role="button"], div, span, a, p, li');
-          for (var i = 0; i < buttons.length; i++) {
-            var el = buttons[i];
-            if (!visible(el)) continue;
-            var t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-            if (t !== '技能' || el.getAttribute('aria-label')) continue;
-            var r = el.getBoundingClientRect();
-            var area = r.width * r.height;
-            if (area < skillArea) { skillArea = area; skillBtn = el; }
+          var skillDeadline = Date.now() + 15000;
+          while (Date.now() < skillDeadline && !skillBtn) {
+            var buttons = document.querySelectorAll('button, [role="button"], div, span, a, p, li');
+            for (var i = 0; i < buttons.length; i++) {
+              var el = buttons[i];
+              if (!visible(el)) continue;
+              var t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+              if (t !== '技能' || el.getAttribute('aria-label')) continue;
+              var r = el.getBoundingClientRect();
+              var area = r.width * r.height;
+              if (area < skillArea) { skillArea = area; skillBtn = el; }
+            }
+            if (!skillBtn) await sleep(300);
           }
           if (!skillBtn) {
             var diagBtns = [];
@@ -5275,7 +5460,25 @@ export async function openCanvasVideoComposer(webview: WebviewHandle): Promise<C
         activate(videoTool);
         // 5. 等视频节点配置条挂载
         var err = await waitForComposerControls(15000);
-        if (err) return { ok: false, error: err };
+        if (err) {
+          // 节点可能已创建但未被选中（配置条仅在节点选中时出现）：
+          // 定位画布上的视频节点，返回坐标交由宿主原生点击选中
+          var nodeEl = null, nodeArea = Infinity;
+          var cands = document.querySelectorAll('[aria-label]');
+          for (var n = 0; n < cands.length; n++) {
+            var na = cands[n].getAttribute('aria-label') || '';
+            if (!/生成视频|视频生成|视频节点/.test(na)) continue;
+            var nr = cands[n].getBoundingClientRect();
+            if (nr.width < 80 || nr.height < 80) continue;
+            var nArea = nr.width * nr.height;
+            if (nArea < nodeArea) { nodeArea = nArea; nodeEl = cands[n]; }
+          }
+          if (nodeEl) {
+            var nrect = nodeEl.getBoundingClientRect();
+            return { ok: false, error: err, needSelect: true, x: Math.round(nrect.left + nrect.width / 2), y: Math.round(nrect.top + nrect.height / 2) };
+          }
+          return { ok: false, error: err };
+        }
         return { ok: true };
       } catch (e) {
         return { ok: false, error: e.message };
@@ -5283,7 +5486,42 @@ export async function openCanvasVideoComposer(webview: WebviewHandle): Promise<C
     })()
   `;
   try {
-    const result = await safeExecuteJS<CanvasFlowResult & { reused?: boolean }>(webview, code, 60000, 'openCanvasVideoComposer');
+    const result = await safeExecuteJS<CanvasFlowResult & { reused?: boolean; needSelect?: boolean; x?: number; y?: number }>(webview, code, 60000, 'openCanvasVideoComposer');
+    if (!result.ok && result.needSelect && typeof webview.sendInputEvent === 'function') {
+      // 节点已创建但未选中：先适配视图（节点可能已被平移出视口），
+      // 再重新定位节点并原生点击选中，配置条才会挂载
+      const se = webview.sendInputEvent.bind(webview) as NonNullable<typeof webview.sendInputEvent>;
+      await canvasFitToView(webview, se);
+      let controlsReady = false;
+      for (let round = 0; round < 2 && !controlsReady; round += 1) {
+        const node = await safeExecuteJS<{ found: boolean; x?: number; y?: number }>(
+          webview, CANVAS_VIDEO_NODE_LOCATOR, 3000, 'locateCanvasVideoNodeForSelect',
+        ).catch(() => ({ found: false }) as { found: boolean; x?: number; y?: number });
+        if (node.found && typeof node.x === 'number' && typeof node.y === 'number') {
+          const px = node.x;
+          const py = node.y;
+          se({ type: 'mouseMove', x: px, y: py });
+          se({ type: 'mouseDown', x: px, y: py, button: 'left', clickCount: 1 });
+          se({ type: 'mouseUp', x: px, y: py, button: 'left', clickCount: 1 });
+        }
+        for (let p = 0; p < 24 && !controlsReady; p += 1) {
+          const re = await safeExecuteJS<{ ready: boolean }>(webview, CANVAS_COMPOSER_CONTROLS_READY, 3000, 'waitCanvasControlsAfterSelect')
+            .catch(() => ({ ready: false }));
+          if (re.ready) controlsReady = true;
+          else await sleep(250);
+        }
+        if (!controlsReady && round === 0) {
+          // 仍未就绪：再适配一次视图（可能第一次点击选中了错误位置）
+          await canvasFitToView(webview, se);
+        }
+      }
+      if (controlsReady) {
+        console.log('[doubaoBridge] 画布视频节点已通过点击选中，配置条就绪');
+        return { ok: true };
+      }
+      console.warn('[doubaoBridge] 打开画布视频节点失败:', `${result.error}；点击节点选中后配置条仍未挂载`);
+      return { ok: false, error: `${result.error}；点击节点选中后配置条仍未挂载` };
+    }
     if (result.ok) {
       console.log(`[doubaoBridge] 画布视频节点就绪${result.reused ? '（复用已有节点）' : ''}`);
       return { ok: true };
@@ -5309,6 +5547,80 @@ export async function configureCanvasVideoOptions(
   if (!Number.isInteger(durationSec) || durationSec < 4 || durationSec > 15) {
     return { ok: false, error: `无效的视频时长: ${config.duration}` };
   }
+  const sendInputEvent = typeof webview.sendInputEvent === 'function'
+    ? (webview.sendInputEvent.bind(webview) as NonNullable<typeof webview.sendInputEvent>)
+    : null;
+  /** 原生鼠标点击：画布浮层（Radix）校验事件 isTrusted，合成 dispatchEvent 无法打开面板。 */
+  const nativeClick = (x: number, y: number) => {
+    if (!sendInputEvent) return;
+    sendInputEvent({ type: 'mouseMove', x, y });
+    sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+    sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+  };
+  const panelOpenCheckScript = `
+    (function() {
+      var sliders = document.querySelectorAll('[role="slider"]');
+      for (var i = 0; i < sliders.length; i++) {
+        if (sliders[i].getAttribute('aria-valuemin') === '0' && sliders[i].getAttribute('aria-valuemax') === '11') return { open: true };
+      }
+      return { open: false };
+    })()
+  `;
+  const durationTriggerLocatorScript = `
+    (function() {
+      function normText(el) { return (el.innerText || '').replace(/\\s+/g, ' ').trim(); }
+      function visible(el) {
+        if (!el) return false;
+        var r = el.getBoundingClientRect();
+        var s = window.getComputedStyle(el);
+        return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
+      }
+      var buttons = document.querySelectorAll('button');
+      for (var i = 0; i < buttons.length; i++) {
+        if (!visible(buttons[i])) continue;
+        var t = normText(buttons[i]);
+        if (/^\\S+\\s*·\\s*\\d+s$/.test(t)) {
+          var r = buttons[i].getBoundingClientRect();
+          return { found: true, x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        }
+      }
+      return { found: false };
+    })()
+  `;
+  const sliderLocatorScript = `
+    (function() {
+      var sliders = document.querySelectorAll('[role="slider"]');
+      for (var i = 0; i < sliders.length; i++) {
+        var el = sliders[i];
+        if (el.getAttribute('aria-valuemin') === '0' && el.getAttribute('aria-valuemax') === '11') {
+          var r = el.getBoundingClientRect();
+          if (r.width <= 0) continue;
+          el.focus();
+          var track = el.parentElement;
+          for (var up = 0; track && up < 4; up++) {
+            if (track.getBoundingClientRect().width >= r.width * 2) break;
+            track = track.parentElement;
+          }
+          var tr = track ? track.getBoundingClientRect() : r;
+          return { pos: Math.round(r.left + r.width / 2) + ',' + Math.round(r.top + r.height / 2),
+            track: Math.round(tr.left) + ',' + Math.round(tr.right) + ',' + Math.round(tr.top + tr.height / 2),
+            now: String(el.getAttribute('aria-valuenow') || '') };
+        }
+      }
+      return {};
+    })()
+  `;
+  const barTextReaderScript = `
+    (function() {
+      var buttons = document.querySelectorAll('button');
+      for (var i = 0; i < buttons.length; i++) {
+        var t = (buttons[i].innerText || '').replace(/\\s+/g, ' ').trim();
+        var m = t.match(/^(\\S+)\\s*·\\s*(\\d+)s$/);
+        if (m) return { ratio: m[1], duration: m[2] + 's' };
+      }
+      return {};
+    })()
+  `;
   const code = `
     (async function() {
       function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
@@ -5396,40 +5708,97 @@ export async function configureCanvasVideoOptions(
         }
         await sleep(400);
 
-        // ---- 2. 打开「比例/时长」面板并等待滑杆挂载 ----
-        // 注意：必须先设时长、后点比例——实测选中比例后面板会立即收起，
-        // 滑杆从 DOM 消失，之后再设置时长就无从下手。
+        // ---- 2. 定位「比例/时长」按钮，坐标交由宿主用原生鼠标事件打开面板 ----
+        // 注意1：必须先设时长、后点比例——实测选中比例后面板会立即收起。
+        // 注意2：合成 dispatchEvent 会触发浮层的 document 级 outside-pointerdown，
+        // 面板刚打开就被判为外部点击而关闭，因此打开动作不能用 activate()。
         var durationTrigger = null;
         var buttons2 = document.querySelectorAll('button');
         for (var k = 0; k < buttons2.length; k++) {
           if (!visible(buttons2[k])) continue;
           var t3 = normText(buttons2[k]);
-          if (/^\S+\s*·\s*\d+s$/.test(t3)) { durationTrigger = buttons2[k]; break; }
+          if (/^\\S+\\s*·\\s*\\d+s$/.test(t3)) { durationTrigger = buttons2[k]; break; }
         }
         if (!durationTrigger) return { ok: false, error: '未找到画布「比例/时长」按钮' };
-        activate(durationTrigger);
-        // 等比例面板出现（包含时长滑杆）
-        var slider = null;
-        var panelDeadline = Date.now() + 8000;
-        while (Date.now() < panelDeadline && !slider) {
-          var sliders = document.querySelectorAll('[role="slider"]');
-          for (var m = 0; m < sliders.length; m++) {
-            if (sliders[m].getAttribute('aria-valuemin') === '0' && sliders[m].getAttribute('aria-valuemax') === '11') { slider = sliders[m]; break; }
-          }
-          if (!slider) await sleep(250);
-        }
-        if (!slider) return { ok: false, error: '时长滑杆未在面板中挂载' };
-        return { ok: true };
+        var triggerRect = durationTrigger.getBoundingClientRect();
+        return { ok: true, x: Math.round(triggerRect.left + triggerRect.width / 2), y: Math.round(triggerRect.top + triggerRect.height / 2) };
       } catch (e) {
         return { ok: false, error: e.message };
       }
     })()
   `;
   try {
-    const result = await safeExecuteJS<CanvasFlowResult>(webview, code, 60000, 'configureCanvasVideoOptions');
+    const result = await safeExecuteJS<CanvasFlowResult & { x?: number; y?: number }>(webview, code, 60000, 'configureCanvasVideoOptions');
     if (!result.ok) {
       console.warn('[doubaoBridge] 画布视频参数配置失败:', result.error);
       return result;
+    }
+    // 面板打开必须走原生点击；合成事件打开的浮层会被立即关闭
+    // 注意：面板已打开时再点触发按钮会将其切换关闭，必须先检测面板状态
+    let triggerX = result.x;
+    let triggerY = result.y;
+    let panelReady = false;
+    let clickDiag = '';
+    for (let attempt = 1; attempt <= 6 && !panelReady; attempt += 1) {
+      // 面板已开（滑杆已在 DOM）→ 直接进入时长设置
+      const preOpen = await safeExecuteJS<{ open: boolean }>(webview, panelOpenCheckScript, 3000, 'checkCanvasPanelPreOpen')
+        .catch(() => ({ open: false }));
+      if (preOpen.open) {
+        panelReady = true;
+        break;
+      }
+      if (typeof triggerX === 'number' && typeof triggerY === 'number') {
+        // 命中校验：确认坐标处仍是「比例/时长」按钮（画布布局会动态漂移，陈旧坐标会点空或误点其他控件）
+        const hit = await safeExecuteJS<{ stale: boolean; hitText: string }>(
+          webview,
+          `
+          (function() {
+            var el = document.elementFromPoint(${triggerX}, ${triggerY});
+            if (!el) return { stale: true, hitText: 'OUT_OF_VIEWPORT' };
+            var btn = el.closest ? el.closest('button') : null;
+            var bt = btn ? (btn.innerText || '').replace(/\\s+/g, ' ').trim() : '';
+            var isTrigger = /^\\S+\\s*·\\s*\\d+s$/.test(bt);
+            return { stale: !isTrigger, hitText: el.tagName + ':' + bt.slice(0, 16) };
+          })()
+          `,
+          3000,
+          'verifyCanvasTriggerHit',
+        ).catch(() => ({ stale: true, hitText: 'EVAL_FAILED' }));
+        if (hit.stale) {
+          const fitted = await canvasFitToView(webview, sendInputEvent);
+          clickDiag += `attempt${attempt}:漂移(${hit.hitText})fit=${fitted} `;
+          const relocated = await safeExecuteJS<CanvasFlowResult & { x?: number; y?: number }>(webview, code, 30000, 'locateCanvasDurationTriggerRetry');
+          if (!relocated.ok) {
+            return { ok: false, error: `定位「比例/时长」按钮失败（${clickDiag}）: ${relocated.error}` };
+          }
+          triggerX = relocated.x;
+          triggerY = relocated.y;
+          clickDiag += `→${triggerX},${triggerY} `;
+          continue;
+        }
+        nativeClick(triggerX, triggerY);
+      }
+      for (let p = 0; p < 20 && !panelReady; p += 1) {
+        const st = await safeExecuteJS<{ open: boolean }>(webview, panelOpenCheckScript, 3000, 'waitCanvasPanelMounted')
+          .catch(() => ({ open: false }));
+        if (st.open) panelReady = true;
+        else await sleep(250);
+      }
+      if (!panelReady) {
+        const fitted = await canvasFitToView(webview, sendInputEvent);
+        clickDiag += `attempt${attempt}@${triggerX},${triggerY}未挂载fit=${fitted} `;
+        console.warn(`[doubaoBridge] 画布参数面板第 ${attempt} 次打开未挂载滑杆，重试`);
+        const retry = await safeExecuteJS<CanvasFlowResult & { x?: number; y?: number }>(webview, code, 30000, 'locateCanvasDurationTriggerRetry');
+        if (!retry.ok) {
+          return { ok: false, error: `原生点击后滑杆未挂载（${clickDiag}）: ${retry.error}` };
+        }
+        triggerX = retry.x;
+        triggerY = retry.y;
+        clickDiag += `→${triggerX},${triggerY} `;
+      }
+    }
+    if (!panelReady) {
+      return { ok: false, error: `原生点击「比例/时长」后滑杆未在面板中挂载（${clickDiag}）` };
     }
   } catch (err: any) {
     return { ok: false, error: err.message };
@@ -5438,8 +5807,10 @@ export async function configureCanvasVideoOptions(
   // 时长滑杆：原生键入（Home 到起点，再按次数右移），与聊天通道同构。
   // 注意：必须在参数面板仍打开时完成回读验证——Escape 会取消节点选中、
   // 连带隐藏配置条与滑杆，导致回读永远失败。
-  if (typeof webview.sendInputEvent === 'function') {
-    const sendInputEvent = webview.sendInputEvent.bind(webview) as NonNullable<typeof webview.sendInputEvent>;
+  if (!sendInputEvent) {
+    return { ok: false, error: 'webview 不支持原生输入事件，无法驱动画布时长滑杆' };
+  }
+  {
     let lastDiag = '';
     const durationOk = await (async (): Promise<boolean> => {
       const MAX_ATTEMPTS = 3;
@@ -5476,88 +5847,39 @@ export async function configureCanvasVideoOptions(
           3000,
           'findCanvasDurationSlider',
         ).catch(() => ({}) as { pos?: string; track?: string; now?: string });
-        // 滑杆不在 DOM（面板已收起）→ 重新点击「比例/时长」按钮打开面板
+        // 滑杆不在 DOM（面板已收起）→ 原生点击「比例/时长」按钮重开面板
+        // （合成 activate() 会被浮层判为外部点击、面板刚开即关）
         if (!sliderInfo.pos) {
-          const reopened = await safeExecuteJS<{ ok: boolean }>(
+          const trig = await safeExecuteJS<{ found: boolean; x?: number; y?: number }>(
             webview,
-            `
-            (async function() {
-              function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
-              function visible(el) {
-                if (!el) return false;
-                var r = el.getBoundingClientRect();
-                var s = window.getComputedStyle(el);
-                return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
-              }
-              function activate(el) {
-                if (!el) return false;
-                var r = el.getBoundingClientRect();
-                if (r.width <= 0 || r.height <= 0) return false;
-                var x = Math.round(r.left + r.width / 2);
-                var y = Math.round(r.top + r.height / 2);
-                var opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
-                try { el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
-                el.dispatchEvent(new MouseEvent('mousedown', opts));
-                try { el.dispatchEvent(new PointerEvent('pointerup', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
-                el.dispatchEvent(new MouseEvent('mouseup', opts));
-                el.dispatchEvent(new MouseEvent('click', opts));
-                return true;
-              }
-              var trigger = null;
-              var buttons = document.querySelectorAll('button');
-              for (var i = 0; i < buttons.length; i++) {
-                if (!visible(buttons[i])) continue;
-                var t = (buttons[i].innerText || '').replace(/\\s+/g, ' ').trim();
-                if (/^\S+\s*·\s*\d+s$/.test(t)) { trigger = buttons[i]; break; }
-              }
-              if (!trigger) return { ok: false };
-              activate(trigger);
-              var deadline = Date.now() + 6000;
-              while (Date.now() < deadline) {
-                var sliders = document.querySelectorAll('[role="slider"]');
-                for (var j = 0; j < sliders.length; j++) {
-                  if (sliders[j].getAttribute('aria-valuemin') === '0' && sliders[j].getAttribute('aria-valuemax') === '11') return { ok: true };
-                }
-                await sleep(250);
-              }
-              return { ok: false };
-            })()
-            `,
-            10000,
-            'reopenCanvasDurationPanel',
-          ).catch(() => ({ ok: false }));
-          if (!reopened.ok) {
-            lastDiag = `面板重开失败(第${attempt}次)`;
+            durationTriggerLocatorScript,
+            4000,
+            'locateCanvasDurationTrigger',
+          ).catch(() => ({ found: false }) as { found: boolean; x?: number; y?: number });
+          if (!trig.found || typeof trig.x !== 'number' || typeof trig.y !== 'number') {
+            lastDiag = `面板重开失败(第${attempt}次)：未找到「比例/时长」按钮`;
             continue;
           }
-          sliderInfo = await safeExecuteJS<{ pos?: string; track?: string; now?: string }>(
-            webview,
-            `
-            (function() {
-              var sliders = document.querySelectorAll('[role="slider"]');
-              for (var i = 0; i < sliders.length; i++) {
-                var el = sliders[i];
-                if (el.getAttribute('aria-valuemin') === '0' && el.getAttribute('aria-valuemax') === '11') {
-                  var r = el.getBoundingClientRect();
-                  if (r.width <= 0) continue;
-                  el.focus();
-                  var track = el.parentElement;
-                  for (var up = 0; track && up < 4; up++) {
-                    if (track.getBoundingClientRect().width >= r.width * 2) break;
-                    track = track.parentElement;
-                  }
-                  var tr = track ? track.getBoundingClientRect() : r;
-                  return { pos: Math.round(r.left + r.width / 2) + ',' + Math.round(r.top + r.height / 2),
-                    track: Math.round(tr.left) + ',' + Math.round(tr.right) + ',' + Math.round(tr.top + tr.height / 2),
-                    now: String(el.getAttribute('aria-valuenow') || '') };
-                }
-              }
-              return {};
-            })()
-            `,
-            3000,
-            'findCanvasDurationSlider',
-          ).catch(() => ({}) as { pos?: string; track?: string; now?: string });
+          nativeClick(trig.x, trig.y);
+          let remounted = false;
+          for (let p = 0; p < 24 && !remounted; p += 1) {
+            const re = await safeExecuteJS<{ pos?: string; track?: string; now?: string }>(
+              webview,
+              sliderLocatorScript,
+              3000,
+              'remountCanvasDurationSlider',
+            ).catch(() => ({}) as { pos?: string; track?: string; now?: string });
+            if (re.pos) {
+              sliderInfo = re;
+              remounted = true;
+            } else {
+              await sleep(250);
+            }
+          }
+          if (!remounted) {
+            lastDiag = `面板重开失败(第${attempt}次)：滑杆未挂载`;
+            continue;
+          }
         }
         lastDiag = `valuenow=${sliderInfo.now || '?'}`;
         if (sliderInfo.pos) {
@@ -5631,7 +5953,7 @@ export async function configureCanvasVideoOptions(
             var buttons = document.querySelectorAll('button');
             for (var i = 0; i < buttons.length; i++) {
               var t = (buttons[i].innerText || '').replace(/\\s+/g, ' ').trim();
-              if (/^\S+\s*·\s*\d+s$/.test(t)) { barText = t; break; }
+              if (/^\\S+\\s*·\\s*\\d+s$/.test(t)) { barText = t; break; }
             }
             var durationOk = Number(sliderNow) === ${durationSec - 4} || barText.indexOf('${durationSec}s') >= 0;
             return { durationOk: durationOk, sliderNow: sliderNow, barText: barText };
@@ -5650,8 +5972,9 @@ export async function configureCanvasVideoOptions(
     if (!durationOk) {
       return { ok: false, error: `画布时长滑杆设置未回读确认（目标 ${durationSec}s；${lastDiag}）` };
     }
-    // 时长就位后最后点比例——选中后面板会收起，所以必须放在最后
-    const ratioClickCode = `
+    // 时长就位后最后点比例——选中后面板会收起，所以必须放在最后。
+    // 比例选项必须原生点击（Radix 浮层校验 isTrusted，合成事件无效）。
+    const ratioLocatorScript = `
       (function() {
         function normText(el) { return (el.innerText || '').replace(/\\s+/g, ' ').trim(); }
         function visible(el) {
@@ -5659,20 +5982,6 @@ export async function configureCanvasVideoOptions(
           var r = el.getBoundingClientRect();
           var s = window.getComputedStyle(el);
           return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
-        }
-        function activate(el) {
-          if (!el) return false;
-          var r = el.getBoundingClientRect();
-          if (r.width <= 0 || r.height <= 0) return false;
-          var x = Math.round(r.left + r.width / 2);
-          var y = Math.round(r.top + r.height / 2);
-          var opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
-          try { el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
-          el.dispatchEvent(new MouseEvent('mousedown', opts));
-          try { el.dispatchEvent(new PointerEvent('pointerup', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
-          el.dispatchEvent(new MouseEvent('mouseup', opts));
-          el.dispatchEvent(new MouseEvent('click', opts));
-          return true;
         }
         var RATIO = ${JSON.stringify(config.aspectRatio)};
         var ratioCands = document.querySelectorAll('button, div, span');
@@ -5685,143 +5994,63 @@ export async function configureCanvasVideoOptions(
           var area = r.width * r.height;
           if (area < bestArea) { best = el; bestArea = area; }
         }
-        if (!best) return { ok: false, error: '比例面板中未找到 ' + RATIO };
-        activate(best);
-        return { ok: true };
+        if (!best) return { found: false };
+        var r2 = best.getBoundingClientRect();
+        return { found: true, x: Math.round(r2.left + r2.width / 2), y: Math.round(r2.top + r2.height / 2) };
       })()
-      `;
-    let ratioResult = await safeExecuteJS<{ ok: boolean; error?: string }>(
-      webview,
-      ratioClickCode,
-      5000,
-      'clickCanvasRatio',
-    ).catch(() => ({ ok: false, error: '比例点击异常' }));
-    if (!ratioResult.ok) {
-      // 面板可能已收起：重开面板后重试一次
-      await safeExecuteJS<{ ok: boolean }>(
-        webview,
-        `
-        (async function() {
-          function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
-          function visible(el) {
-            if (!el) return false;
-            var r = el.getBoundingClientRect();
-            var s = window.getComputedStyle(el);
-            return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
-          }
-          function activate(el) {
-            if (!el) return false;
-            var r = el.getBoundingClientRect();
-            if (r.width <= 0 || r.height <= 0) return false;
-            var x = Math.round(r.left + r.width / 2);
-            var y = Math.round(r.top + r.height / 2);
-            var opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
-            try { el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
-            el.dispatchEvent(new MouseEvent('mousedown', opts));
-            try { el.dispatchEvent(new PointerEvent('pointerup', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
-            el.dispatchEvent(new MouseEvent('mouseup', opts));
-            el.dispatchEvent(new MouseEvent('click', opts));
-            return true;
-          }
-          var trigger = null;
-          var buttons = document.querySelectorAll('button');
-          for (var i = 0; i < buttons.length; i++) {
-            if (!visible(buttons[i])) continue;
-            var t = (buttons[i].innerText || '').replace(/\\s+/g, ' ').trim();
-            if (/^\\S+\\s*·\\s*\\d+s$/.test(t)) { trigger = buttons[i]; break; }
-          }
-          if (!trigger) return { ok: false };
-          activate(trigger);
-          var deadline = Date.now() + 6000;
-          while (Date.now() < deadline) {
-            var sliders = document.querySelectorAll('[role="slider"]');
-            for (var j = 0; j < sliders.length; j++) {
-              if (sliders[j].getAttribute('aria-valuemin') === '0' && sliders[j].getAttribute('aria-valuemax') === '11') return { ok: true };
-            }
-            await sleep(250);
-          }
-          return { ok: false };
-        })()
-        `,
-        10000,
-        'reopenCanvasPanelForRatio',
-      ).catch(() => ({ ok: false }));
-      ratioResult = await safeExecuteJS<{ ok: boolean; error?: string }>(
-        webview,
-        ratioClickCode,
-        5000,
-        'clickCanvasRatioRetry',
-      ).catch(() => ({ ok: false, error: '比例点击重试异常' }));
-      if (!ratioResult.ok) {
-        return { ok: false, error: ratioResult.error || '画布比例设置失败（重试后仍未找到）' };
+    `;
+    let ratioOk = false;
+    // 配置条已是目标比例则无需再点
+    const bar0 = await safeExecuteJS<{ ratio?: string; duration?: string }>(
+      webview, barTextReaderScript, 3000, 'readCanvasBarTextBeforeRatio',
+    ).catch(() => ({}) as { ratio?: string; duration?: string });
+    if (bar0.ratio === config.aspectRatio) {
+      ratioOk = true;
+    }
+    for (let attempt = 1; attempt <= 3 && !ratioOk; attempt += 1) {
+      const pos = await safeExecuteJS<{ found: boolean; x?: number; y?: number }>(
+        webview, ratioLocatorScript, 4000, 'locateCanvasRatio',
+      ).catch(() => ({ found: false }) as { found: boolean; x?: number; y?: number });
+      if (!pos.found || typeof pos.x !== 'number' || typeof pos.y !== 'number') {
+        // 面板已收起：原生点击重开面板后重试
+        const trig = await safeExecuteJS<{ found: boolean; x?: number; y?: number }>(
+          webview, durationTriggerLocatorScript, 4000, 'locateCanvasDurationTriggerForRatio',
+        ).catch(() => ({ found: false }) as { found: boolean; x?: number; y?: number });
+        if (!trig.found || typeof trig.x !== 'number' || typeof trig.y !== 'number') {
+          lastDiag = `比例重试(第${attempt}次)：面板与「比例/时长」按钮均未找到`;
+          break;
+        }
+        nativeClick(trig.x, trig.y);
+        await sleep(800);
+        continue;
+      }
+      nativeClick(pos.x, pos.y);
+      // 选中比例后面板收起，配置条文本变为「比例 · 时长」，轮询回读
+      for (let p = 0; p < 12 && !ratioOk; p += 1) {
+        const bar = await safeExecuteJS<{ ratio?: string; duration?: string }>(
+          webview, barTextReaderScript, 3000, 'verifyCanvasRatioText',
+        ).catch(() => ({}) as { ratio?: string; duration?: string });
+        if (bar.ratio === config.aspectRatio) ratioOk = true;
+        else await sleep(250);
+      }
+      if (!ratioOk) {
+        // 面板可能仍开着（配置条文本被遮）：先确认再 Escape，避免取消节点选中
+        const stillOpen = await safeExecuteJS<{ open: boolean }>(
+          webview, panelOpenCheckScript, 3000, 'checkCanvasPanelOpenBeforeEscape',
+        ).catch(() => ({ open: false }));
+        if (stillOpen.open) {
+          sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
+          sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
+          await sleep(400);
+        }
+        const bar2 = await safeExecuteJS<{ ratio?: string; duration?: string }>(
+          webview, barTextReaderScript, 3000, 'verifyCanvasRatioTextAfterClose',
+        ).catch(() => ({}) as { ratio?: string; duration?: string });
+        if (bar2.ratio === config.aspectRatio) ratioOk = true;
       }
     }
-    await sleep(400);
-    // 若面板仍未收起（滑杆还在 DOM），发 Escape 关闭；已收起则不再打扰
-    const panelStillOpen = await safeExecuteJS<{ open: boolean }>(
-      webview,
-      `
-      (function() {
-        var sliders = document.querySelectorAll('[role="slider"]');
-        for (var i = 0; i < sliders.length; i++) {
-          if (sliders[i].getAttribute('aria-valuemin') === '0' && sliders[i].getAttribute('aria-valuemax') === '11') return { open: true };
-        }
-        return { open: false };
-      })()
-      `,
-      3000,
-      'checkCanvasPanelOpen',
-    ).catch(() => ({ open: false }));
-    if (panelStillOpen.open) {
-      sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
-      sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
-    }
-  } else {
-    // 无法发送原生键盘事件时，尝试用 JS 键盘事件驱动滑杆
-    await safeExecuteJS<{ ok: boolean }>(
-      webview,
-      `
-      (async function() {
-        function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
-        var sliders = document.querySelectorAll('[role="slider"]');
-        var target = null;
-        for (var i = 0; i < sliders.length; i++) {
-          if (sliders[i].getAttribute('aria-valuemin') === '0' && sliders[i].getAttribute('aria-valuemax') === '11') { target = sliders[i]; break; }
-        }
-        if (!target) return { ok: false };
-        target.focus();
-        var opts = { key: 'Home', code: 'Home', keyCode: 36, which: 36, bubbles: true, cancelable: true };
-        target.dispatchEvent(new KeyboardEvent('keydown', opts));
-        await sleep(120);
-        for (var s = 0; s < ${durationSec - 4}; s++) {
-          var ko = { key: 'Right', code: 'Right', keyCode: 39, which: 39, bubbles: true, cancelable: true };
-          target.dispatchEvent(new KeyboardEvent('keydown', ko));
-          await sleep(80);
-        }
-        await sleep(200);
-        return { ok: Number(target.getAttribute('aria-valuenow')) === ${durationSec - 4} };
-      })()
-      `,
-      15000,
-      'setCanvasDurationViaJS',
-    ).catch(() => ({ ok: false }));
-    const fallbackCheck = await safeExecuteJS<{ durationOk: boolean }>(
-      webview,
-      `
-      (function() {
-        var sliders = document.querySelectorAll('[role="slider"]');
-        for (var j = 0; j < sliders.length; j++) {
-          if (sliders[j].getAttribute('aria-valuemin') === '0' && sliders[j].getAttribute('aria-valuemax') === '11'
-            && Number(sliders[j].getAttribute('aria-valuenow')) === ${durationSec - 4}) return { durationOk: true };
-        }
-        return { durationOk: false };
-      })()
-      `,
-      3000,
-      'checkCanvasDurationFallback',
-    ).catch(() => ({ durationOk: false }));
-    if (!fallbackCheck.durationOk) {
-      return { ok: false, error: `画布时长滑杆设置未回读确认（目标 ${durationSec}s）` };
+    if (!ratioOk) {
+      return { ok: false, error: `画布比例设置未回读确认（目标 ${config.aspectRatio}；${lastDiag}）` };
     }
   }
   await sleep(300);
@@ -5838,7 +6067,7 @@ export async function configureCanvasVideoOptions(
         for (var i = 0; i < buttons.length; i++) {
           var t = (buttons[i].innerText || '').replace(/\\s+/g, ' ').trim();
           if (t.indexOf('模型 ') === 0 && t.indexOf(${JSON.stringify(modelLabel)}) >= 0) modelOk = true;
-          if (/^\S+\s*·\s*\d+s$/.test(t)) { texts.push(t); if (t.indexOf(${JSON.stringify(`${durationSec}s`)}) >= 0) durationOk = true; }
+          if (/^\\S+\\s*·\\s*\\d+s$/.test(t)) { texts.push(t); if (t.indexOf(${JSON.stringify(`${durationSec}s`)}) >= 0) durationOk = true; }
         }
         return { modelOk: modelOk, durationOk: durationOk, texts: texts.join('|') };
       })()
@@ -5865,93 +6094,121 @@ export async function configureCanvasVideoOptions(
  * 之后可复用 uploadReferenceImages 的 DataTransfer 注入。
  */
 export async function openCanvasUploadPicker(webview: WebviewHandle): Promise<CanvasFlowResult> {
-  const code = `
-    (async function() {
-      function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+  const sendInputEvent = typeof webview.sendInputEvent === 'function'
+    ? (webview.sendInputEvent.bind(webview) as NonNullable<typeof webview.sendInputEvent>)
+    : null;
+  const nativeClick = (x: number, y: number) => {
+    if (!sendInputEvent) return;
+    sendInputEvent({ type: 'mouseMove', x, y });
+    sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+    sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+  };
+  // 「+」按钮（Radix 下拉触发器）：data-testid 优先，其次无文本无 aria 的按钮。
+  // 注意：配置条可能把「+」与模式芯片分放在不同子容器（overflow list），
+  // 必须向上找到「同时包含 + 与模型按钮」的公共容器，不能在第一个含模型的子容器就停。
+  const plusFinderScript = `
+    (function() {
+      function normText(el) { return (el.innerText || '').replace(/\\s+/g, ' ').trim(); }
       function visible(el) {
         if (!el) return false;
         var r = el.getBoundingClientRect();
         return r.width > 2 && r.height > 2;
       }
-      function activate(el) {
+      var chips = document.querySelectorAll('button');
+      for (var i = 0; i < chips.length; i++) {
+        var b = chips[i];
+        if (!visible(b) || b.getAttribute('aria-label')) continue;
+        if (normText(b) !== '视频生成') continue;
+        var root = b;
+        for (var d = 0; d < 12 && root.parentElement; d++) {
+          root = root.parentElement;
+          var plus = root.querySelector('button[data-testid="upload_file_button"]');
+          if (!plus) continue;
+          var rb = root.querySelectorAll('button');
+          var hasModel = false;
+          for (var x = 0; x < rb.length; x++) {
+            if (normText(rb[x]).indexOf('模型 ') === 0) { hasModel = true; break; }
+          }
+          if (!hasModel) continue;
+          var r = plus.getBoundingClientRect();
+          if (r.width > 0) {
+            return { found: true, x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+          }
+        }
+      }
+      return { found: false };
+    })()
+  `;
+  const uploadItemFinderScript = `
+    (function() {
+      function normText(el) { return (el.innerText || '').replace(/\\s+/g, ' ').trim(); }
+      function visible(el) {
         if (!el) return false;
         var r = el.getBoundingClientRect();
-        if (r.width <= 0 || r.height <= 0) return false;
-        var x = Math.round(r.left + r.width / 2);
-        var y = Math.round(r.top + r.height / 2);
-        var opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
-        try { el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
-        el.dispatchEvent(new MouseEvent('mousedown', opts));
-        try { el.dispatchEvent(new PointerEvent('pointerup', Object.assign({ pointerId: 1, pointerType: 'mouse', isPrimary: true }, opts))); } catch (_) {}
-        el.dispatchEvent(new MouseEvent('mouseup', opts));
-        el.dispatchEvent(new MouseEvent('click', opts));
-        return true;
+        var s = window.getComputedStyle(el);
+        return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none';
       }
-      try {
-        function findComposerContainer() {
-          var buttons = document.querySelectorAll('button');
-          for (var i = 0; i < buttons.length; i++) {
-            var b = buttons[i];
-            if (!visible(b) || b.getAttribute('aria-label')) continue;
-            if ((b.innerText || '').replace(/\\s+/g, ' ').trim() !== '视频生成') continue;
-            var root = b;
-            for (var d = 0; d < 10 && root.parentElement; d++) {
-              root = root.parentElement;
-              if (root.querySelector('button') && Array.from(root.querySelectorAll('button')).some(function(x) {
-                return ((x.innerText || '')).indexOf('模型 ') === 0;
-              })) return root;
-            }
-          }
-          return null;
+      var mis = document.querySelectorAll('[role="menuitem"]');
+      for (var i = 0; i < mis.length; i++) {
+        if (!visible(mis[i])) continue;
+        if (normText(mis[i]) === '上传文件') {
+          var r = mis[i].getBoundingClientRect();
+          return { found: true, x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
         }
-        var container = findComposerContainer();
-        if (!container) return { ok: false, error: '未找到画布视频配置条容器' };
-        // 优先用 data-testid 定位「+」按钮，其次无文本无 aria 的按钮
-        var plus = container.querySelector('button[data-testid="upload_file_button"]');
-        if (!plus) {
-          var cands = container.querySelectorAll('button');
-          for (var j = 0; j < cands.length; j++) {
-            var el = cands[j];
-            if (!visible(el)) continue;
-            var t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-            if (t === '' && !el.getAttribute('aria-label')) { plus = el; break; }
-          }
-        }
-        if (!plus) return { ok: false, error: '未找到配置条「+」按钮' };
-        activate(plus);
-        // 「+」打开下拉菜单（Radix），需继续点击菜单项「上传文件」
-        var uploadItem = null;
-        var menuDeadline = Date.now() + 6000;
-        while (Date.now() < menuDeadline && !uploadItem) {
-          var mis = document.querySelectorAll('[role="menuitem"]');
-          for (var k2 = 0; k2 < mis.length; k2++) {
-            var mi = mis[k2];
-            if (!visible(mi)) continue;
-            var mt = (mi.innerText || '').replace(/\\s+/g, ' ').trim();
-            if (mt === '上传文件') { uploadItem = mi; break; }
-          }
-          if (!uploadItem) await sleep(250);
-        }
-        if (uploadItem) {
-          activate(uploadItem);
-        }
-        // 等待 file input 挂载
-        var deadline = Date.now() + 6000;
-        while (Date.now() < deadline) {
-          var inputs = document.querySelectorAll('input[type="file"]');
-          for (var k = 0; k < inputs.length; k++) {
-            if (visible(inputs[k]) || inputs[k].files) return { ok: true };
-          }
-          await sleep(250);
-        }
-        return { ok: false, error: '点击「+/上传文件」后文件输入框未挂载' };
-      } catch (e) {
-        return { ok: false, error: e.message };
       }
+      return { found: false };
+    })()
+  `;
+  const fileInputCheckScript = `
+    (function() {
+      var inputs = document.querySelectorAll('input[type="file"]');
+      for (var i = 0; i < inputs.length; i++) {
+        var r = inputs[i].getBoundingClientRect();
+        if (r.width > 2 && r.height > 2) return { ok: true };
+        if (inputs[i].files) return { ok: true };
+      }
+      return { ok: false };
     })()
   `;
   try {
-    return await safeExecuteJS<CanvasFlowResult>(webview, code, 15000, 'openCanvasUploadPicker');
+    if (!sendInputEvent) {
+      return { ok: false, error: 'webview 不支持原生输入事件，无法打开画布上传菜单' };
+    }
+    // 「+」是 Radix 下拉触发器：原生点击打开菜单（合成事件会被浮层判为外部点击立即关闭）
+    let itemClicked = false;
+    for (let attempt = 1; attempt <= 3 && !itemClicked; attempt += 1) {
+      const plus = await safeExecuteJS<{ found: boolean; x?: number; y?: number }>(
+        webview, plusFinderScript, 4000, 'locateCanvasPlusButton',
+      ).catch(() => ({ found: false }) as { found: boolean; x?: number; y?: number });
+      if (!plus.found || typeof plus.x !== 'number' || typeof plus.y !== 'number') {
+        return { ok: false, error: '未找到配置条「+」按钮' };
+      }
+      nativeClick(plus.x, plus.y);
+      // 等「上传文件」菜单项出现并原生点击
+      for (let p = 0; p < 16 && !itemClicked; p += 1) {
+        const item = await safeExecuteJS<{ found: boolean; x?: number; y?: number }>(
+          webview, uploadItemFinderScript, 3000, 'locateCanvasUploadMenuItem',
+        ).catch(() => ({ found: false }) as { found: boolean; x?: number; y?: number });
+        if (item.found && typeof item.x === 'number' && typeof item.y === 'number') {
+          nativeClick(item.x, item.y);
+          itemClicked = true;
+        } else {
+          await sleep(250);
+        }
+      }
+    }
+    if (!itemClicked) {
+      return { ok: false, error: '「+」菜单未弹出「上传文件」菜单项' };
+    }
+    // 等待 file input 挂载
+    for (let p = 0; p < 24; p += 1) {
+      const st = await safeExecuteJS<{ ok: boolean }>(
+        webview, fileInputCheckScript, 3000, 'waitCanvasFileInputMounted',
+      ).catch(() => ({ ok: false }));
+      if (st.ok) return { ok: true };
+      await sleep(250);
+    }
+    return { ok: false, error: '点击「+/上传文件」后文件输入框未挂载' };
   } catch (err: any) {
     return { ok: false, error: err.message };
   }

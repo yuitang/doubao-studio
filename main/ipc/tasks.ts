@@ -367,6 +367,7 @@ const TASK_IPC_CHANNELS = [
   'tasks:getCompletedOutputs', 'tasks:selectImages', 'tasks:selectAudio',
   'tasks:readFileAsBase64', 'tasks:downloadOutputs', 'tasks:downloadPublicShareMedia', 'tasks:listDownloads',
   'tasks:exportDiagnostics', 'tasks:validateArtifact', 'tasks:saveAdapterReport',
+  'tasks:canvasSetFileInputFiles',
   'tasks:selectAdapterRules', 'settings:get', 'settings:save', 'tasks:selectSaveDir',
 ] as const;
 
@@ -631,6 +632,54 @@ export function registerTaskIPC(): () => void {
           return { success: true };
         }
         return { success: true, filePath: result.filePaths[0] };
+      } catch (err: any) {
+        return { success: false, error: err.message };
+      }
+    }
+  );
+
+  // ---- 画布上传：通过 CDP 原生设置 file input（等效用户真实选择文件） ----
+  // 豆包画布对 DataTransfer 合成注入不响应；DOM.setFileInputFiles 是浏览器原生机制，
+  // 设置后浏览器会自动派发 change，任何框架都能识别。
+  ipcMain.handle(
+    'tasks:canvasSetFileInputFiles',
+    async (_event, params: { files: string[] }): Promise<{ success: boolean; inputCount?: number; usedIndex?: number; error?: string }> => {
+      const { webContents } = require('electron') as typeof import('electron');
+      try {
+        const files = Array.isArray(params?.files) ? params.files.filter((f) => typeof f === 'string' && f.length > 0) : [];
+        if (!files.length) return { success: false, error: 'files 为空' };
+        const guests = webContents.getAllWebContents().filter((wc) => wc.getURL().includes('doubao.com'));
+        if (!guests.length) return { success: false, error: '未找到豆包 webview webContents' };
+        const wc = guests[guests.length - 1];
+        const wasAttached = wc.debugger.isAttached();
+        if (!wasAttached) wc.debugger.attach('1.3');
+        try {
+          const doc = await wc.debugger.sendCommand('DOM.getDocument') as { root: { nodeId: number } };
+          const q = await wc.debugger.sendCommand('DOM.querySelectorAll', {
+            nodeId: doc.root.nodeId,
+            selector: 'input[type=file]',
+          }) as { nodeIds: number[] };
+          if (!q.nodeIds.length) return { success: false, error: '页面上没有挂载的 file input（上传菜单可能已关闭）' };
+          // 优先选可见（有盒模型且尺寸 > 2px）的 input；都不可见则取最后一个（画布菜单新挂载的通常在末尾）
+          let usedIndex = q.nodeIds.length - 1;
+          for (let i = 0; i < q.nodeIds.length; i += 1) {
+            try {
+              const box = await wc.debugger.sendCommand('DOM.getBoxModel', { nodeId: q.nodeIds[i] }) as { model?: { content?: number[] } } | null;
+              const c = box?.model?.content;
+              if (c && c.length >= 8) {
+                const w = Math.abs(c[2] - c[0]);
+                const h = Math.abs(c[5] - c[1]);
+                if (w > 2 && h > 2) { usedIndex = i; break; }
+              }
+            } catch { /* 不可测量的节点跳过 */ }
+          }
+          await wc.debugger.sendCommand('DOM.setFileInputFiles', { nodeId: q.nodeIds[usedIndex], files });
+          return { success: true, inputCount: q.nodeIds.length, usedIndex };
+        } finally {
+          if (!wasAttached) {
+            try { wc.debugger.detach(); } catch { /* 已分离 */ }
+          }
+        }
       } catch (err: any) {
         return { success: false, error: err.message };
       }

@@ -115,6 +115,8 @@ const electronAPI = {
       ipcRenderer.invoke('tasks:selectAudio'),
     readFileAsBase64: (filePath: string): Promise<{ success: boolean; data?: string; error?: string }> =>
       ipcRenderer.invoke('tasks:readFileAsBase64', filePath),
+    canvasSetFileInputFiles: (files: string[]): Promise<{ success: boolean; inputCount?: number; usedIndex?: number; error?: string }> =>
+      ipcRenderer.invoke('tasks:canvasSetFileInputFiles', { files }),
     downloadOutputs: (
       outputs: Array<{ taskId: string; prompt: string; outputs: string[]; accountId: string | null; mode: GenerationMode }>,
       saveDir?: string

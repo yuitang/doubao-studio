@@ -162,6 +162,7 @@ export interface ElectronAPI {
     selectImages: () => Promise<FileSelectResult>;
     selectAudio: () => Promise<AudioSelectResult>;
     readFileAsBase64: (filePath: string) => Promise<ReadFileAsBase64Result>;
+    canvasSetFileInputFiles: (files: string[]) => Promise<{ success: boolean; inputCount?: number; usedIndex?: number; error?: string }>;
     downloadOutputs: (outputs: CompletedOutput[], saveDir?: string) => Promise<TaskDownloadOutputsResult>;
     downloadPublicShareMedia: (shareUrl: string, saveDir?: string) => Promise<PublicShareMediaDownloadResult>;
     listDownloads: () => Promise<DownloadJob[]>;

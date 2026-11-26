@@ -1425,15 +1425,29 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
         // 有参考图片时上传
         if (attachments && attachments.length > 0) {
           setAccountAutomationState(accountId, 'injecting', '上传参考图片...', 'uploading_assets');
+          let canvasPickerError = '';
+          let skipInject = false;
           if (canvasMode) {
-            // 画布通道：先点击视频节点配置条「+」促使文件输入框挂载，再注入文件
+            // 画布通道：先点击视频节点配置条「+」促使文件输入框挂载，
+            // 再通过 CDP DOM.setFileInputFiles 原生设置文件（豆包对 DataTransfer 合成注入不响应）
             const picker = await openCanvasUploadPicker(webview);
             if (!picker.ok) {
+              canvasPickerError = picker.error || '未知原因';
               console.warn('[BrowserPanel] 画布上传挂载失败，尝试直接注入:', picker.error);
+            } else {
+              const cdpSet = await window.electronAPI.tasks.canvasSetFileInputFiles([...attachments]);
+              if (cdpSet.success) {
+                skipInject = true;
+                console.log(`[BrowserPanel] CDP 原生注入成功: inputs=${cdpSet.inputCount} usedIndex=${cdpSet.usedIndex}`);
+              } else {
+                canvasPickerError = `CDP 注入失败: ${cdpSet.error || '未知原因'}`;
+                console.warn('[BrowserPanel] CDP 注入失败，退回 DataTransfer 注入:', cdpSet.error);
+              }
             }
           }
           // 读取文件为 base64
           const fileDataList: Array<{ name: string; base64: string; mime: string }> = [];
+          const assetReadErrors: string[] = [];
           for (const filePath of attachments) {
             try {
               const result = await window.electronAPI.tasks.readFileAsBase64(filePath);
@@ -1443,20 +1457,24 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
                 const mime = mimeMatch ? mimeMatch[1] : 'image/jpeg';
                 const base64 = result.data.replace(/^data:image\/\w+;base64,/, '');
                 fileDataList.push({ name: fileName, base64, mime });
+              } else {
+                assetReadErrors.push(`${filePath.split(/[/\\]/).pop()}: ${result.error || 'IPC 返回失败'}`);
               }
             } catch (e: any) {
+              assetReadErrors.push(`${filePath.split(/[/\\]/).pop()}: ${e.message}`);
               console.warn(`[BrowserPanel] 读取文件失败 ${filePath}:`, e.message);
             }
           }
           if (fileDataList.length !== attachments.length) {
             throw new VideoControlReadinessError('assets', {
               ...createVideoReadinessCheckpoint('assets'), ready: false, failureStage: 'assets', missingControl: 'asset_upload',
-            });
+            }, `读取成功 ${fileDataList.length}/${attachments.length}；失败详情: ${assetReadErrors.join('；') || '无'}`);
           }
           let lastUploadPersistAt = -Infinity;
           const uploaded = await uploadReferenceImages(webview, fileDataList, {
             timeoutMs: 180_000,
             stableSamples: 3,
+            skipInject,
             onProgress: async (diagnostic) => {
               if (diagnostic.elapsedMs - lastUploadPersistAt < 5000 && diagnostic.failure !== undefined) return;
               lastUploadPersistAt = diagnostic.elapsedMs;
@@ -1468,7 +1486,7 @@ const BrowserPanel: React.FC<BrowserPanelProps> = ({
           });
           if (!uploaded) throw new VideoControlReadinessError('assets', {
             ...createVideoReadinessCheckpoint('assets'), ready: false, failureStage: 'assets', missingControl: 'asset_upload',
-          });
+          }, `${canvasMode && canvasPickerError ? `画布上传挂载失败: ${canvasPickerError}；` : ''}uploadReferenceImages=false`);
         }
 
         // 有参考音频时上传（仅视频模式）

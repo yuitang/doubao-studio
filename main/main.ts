@@ -9,7 +9,7 @@
  * 4. 窗口生命周期管理
  */
 
-import { app, BrowserWindow, ipcMain, session, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, screen, session, shell } from 'electron';
 import { randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -198,8 +198,14 @@ function createMainWindow(): BrowserWindow {
   // 窗口准备好后显示
   win.once('ready-to-show', () => {
     win.show();
+    // 大屏默认最大化：画布编辑器（右侧节点面板 + 底部配置条）需要足够横向空间，
+    // 窗口过窄时配置条会溢出 webview 视口，原生点击无法命中。
+    if (screen.getPrimaryDisplay().workAreaSize.width >= 1920) {
+      win.maximize();
+    }
     // CDP 验收已能观察 renderer；不要再额外打开 DevTools 窗口和渲染进程。
-    if (isDev && !localCdp.enabled) {
+    // 带 --remote-debugging-port 启动时同样跳过（独立 DevTools 窗口会干扰主窗口焦点）。
+    if (isDev && !localCdp.enabled && !process.argv.some((a) => a.startsWith('--remote-debugging-port'))) {
       win.webContents.openDevTools({ mode: 'detach' });
     }
   });
